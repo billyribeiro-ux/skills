@@ -122,6 +122,15 @@ function startServer(port) {
       return;
     }
 
+    if (pathname.includes('logger-transport-iframe')) {
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end('<!doctype html><html></html>');
+      return;
+    }
+
     if (
       pathname === '/__cookiebot_mock.js' ||
       pathname.includes('/uc.js') ||

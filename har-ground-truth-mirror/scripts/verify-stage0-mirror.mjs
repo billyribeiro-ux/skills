@@ -257,6 +257,23 @@ async function inspectSurface(page, isLocalAirgap) {
       }
       return route.continue();
     });
+  } else {
+    await page.route('**/*', (route) => {
+      const u = route.request().url();
+      if (!u.startsWith('data:') && !u.startsWith('blob:')) {
+        try {
+          const parsed = new URL(u);
+          if (TELEMETRY_HOSTS.some((t) => parsed.hostname.includes(t) || u.includes(t))) {
+            return route.fulfill({
+              status: 200,
+              body: '/* airgap telemetry noop */',
+              contentType: 'application/javascript; charset=utf-8'
+            });
+          }
+        } catch { }
+      }
+      return route.continue();
+    });
   }
 
   page.on('response', (res) => {
@@ -430,8 +447,8 @@ async function run() {
       const localMonitor = await inspectSurface(localPage, true);
 
       const [liveRes, localRes] = await Promise.all([
-        livePage.goto(liveTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }),
-        localPage.goto(localTarget, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        livePage.goto(liveTarget, { waitUntil: 'load', timeout: 45000 }),
+        localPage.goto(localTarget, { waitUntil: 'load', timeout: 45000 })
       ]);
 
       if (!localRes || localRes.status() >= 400) {
