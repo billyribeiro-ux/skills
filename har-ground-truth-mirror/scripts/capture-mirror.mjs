@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { chromium } from 'playwright';
 import { extractCdpForensics } from './extract-cdp-forensics.mjs';
 
@@ -225,6 +226,13 @@ function getLocalPathForUrl(urlStr, contentType = '') {
   }
 }
 
+function getQueryKeyedRelPath(relPath, search) {
+  if (!search || search === '?') return relPath;
+  const ext = path.extname(relPath);
+  const qHash = crypto.createHash('sha1').update(search).digest('hex').slice(0, 12);
+  return `${relPath}__q_${qHash}${ext}`;
+}
+
 function writeAssetSafely(outPath, buf) {
   const relToOut = path.relative(OUT_DIR, outPath);
   const parts = relToOut.split(path.sep);
@@ -296,8 +304,13 @@ async function downloadFullAsset(urlStr) {
     if (!buf || buf.length === 0) return false;
     if (!validateMagicBytes(buf, ext)) return false;
 
-    const finalPath = writeAssetSafely(path.join(OUT_DIR, relPath), buf);
     const parsedU = new URL(urlStr);
+    const queryRelPath = getQueryKeyedRelPath(relPath, parsedU.search);
+    const writeTarget = queryRelPath !== relPath ? queryRelPath : relPath;
+    const finalPath = writeAssetSafely(path.join(OUT_DIR, writeTarget), buf);
+    if (queryRelPath !== relPath && !fs.existsSync(path.join(OUT_DIR, relPath))) {
+      writeAssetSafely(path.join(OUT_DIR, relPath), buf);
+    }
     if (parsedU.pathname !== decodeURIComponent(parsedU.pathname)) {
       const rawClean = parsedU.pathname.replace(/^\/+/, '');
       const rawRel =
@@ -305,7 +318,11 @@ async function downloadFullAsset(urlStr) {
           ? rawClean
           : path.join('__external', parsedU.hostname, rawClean);
       if (rawRel !== relPath) {
-        writeAssetSafely(path.join(OUT_DIR, rawRel), buf);
+        const rawQueryRel = getQueryKeyedRelPath(rawRel, parsedU.search);
+        writeAssetSafely(path.join(OUT_DIR, rawQueryRel), buf);
+        if (rawQueryRel !== rawRel && !fs.existsSync(path.join(OUT_DIR, rawRel))) {
+          writeAssetSafely(path.join(OUT_DIR, rawRel), buf);
+        }
       }
     }
 
@@ -507,6 +524,13 @@ async function run() {
       if (isRSC || contentType.includes('application/json')) {
         const bodyBuf = await response.body().catch(() => null);
         if (bodyBuf && bodyBuf.length > 0) {
+          if (u.hostname.replace(/^www\./, '') !== targetHost) {
+            const extJsonRel = getLocalPathForUrl(urlStr, contentType);
+            if (extJsonRel) {
+              writeAssetSafely(path.join(OUT_DIR, extJsonRel), bodyBuf);
+              savedAssets.set(urlStr, { relPath: extJsonRel, size: bodyBuf.length });
+            }
+          }
           const fixtureKey = `${u.pathname}${u.search}`;
           const safeFileName = `${u.pathname.replace(/^\/+/, '').replace(/\//g, '__') || 'root'}${u.search ? '__' + Buffer.from(u.search).toString('hex').slice(0, 16) : ''
             }.${isRSC ? 'rsc' : 'json'}`;
@@ -553,7 +577,12 @@ async function run() {
         finalBuf = Buffer.from('/* metrics auto-init disabled for air-gapped parity */\n', 'utf8');
       }
 
-      const outPath = writeAssetSafely(path.join(OUT_DIR, relPath), finalBuf);
+      const queryRelPath = getQueryKeyedRelPath(relPath, u.search);
+      const writeTarget = queryRelPath !== relPath ? queryRelPath : relPath;
+      const outPath = writeAssetSafely(path.join(OUT_DIR, writeTarget), finalBuf);
+      if (queryRelPath !== relPath && !fs.existsSync(path.join(OUT_DIR, relPath))) {
+        writeAssetSafely(path.join(OUT_DIR, relPath), finalBuf);
+      }
       savedAssets.set(urlStr, { relPath: path.relative(OUT_DIR, outPath), size: finalBuf.length });
 
       if (ext === '.css' || contentType.includes('text/css')) {
@@ -725,7 +754,7 @@ async function run() {
 
     for (const m of ssrHtml.matchAll(/(?:data-[a-z0-9-]+|src|poster)=["']([^"']+)["']/gi)) {
       const fullAttr = m[0];
-      const val = m[1].trim();
+      const val = m[1].trim().replace(/&amp;/g, '&');
       if (!val) continue;
       if (
         (fullAttr.includes('basepath') || fullAttr.includes('media-base') || fullAttr.includes('holiday-vat')) &&
@@ -740,7 +769,7 @@ async function run() {
       }
     }
     for (const m of ssrHtml.matchAll(/srcset=["']([^"']+)["']/gi)) {
-      const parts = m[1].split(',').map((p) => p.trim().split(/\s+/)[0]);
+      const parts = m[1].split(',').map((p) => p.trim().split(/\s+/)[0]?.replace(/&amp;/g, '&'));
       for (const p of parts) {
         if (p && (p.startsWith('/') || p.startsWith('http'))) allUrls.add(p);
       }
@@ -818,6 +847,24 @@ async function run() {
         }
       });
       await page.waitForTimeout(300);
+
+      const domMediaUrls = await page.evaluate(() => {
+        const urls = [];
+        for (const el of document.querySelectorAll('img, source, video')) {
+          const s = el.getAttribute('src');
+          if (s) urls.push(s);
+          if (el instanceof HTMLImageElement && el.currentSrc) urls.push(el.currentSrc);
+          const ss = el.getAttribute('srcset');
+          if (ss) {
+            for (const part of ss.split(',')) {
+              const u = part.trim().split(/\s+/)[0];
+              if (u) urls.push(u);
+            }
+          }
+        }
+        return urls;
+      }).catch(() => []);
+      for (const du of domMediaUrls) allUrls.add(du);
     }
 
     for (const rawUrl of allUrls) {
@@ -946,7 +993,7 @@ async function run() {
             const esc = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             // Rewrite inside quoted string literals only (never corrupt /.../ regex literals!)
             next = next.replace(
-              new RegExp(`(["'])https?:\\/\\/${esc}(?=\\/|\\1)`, 'g'),
+              new RegExp(`(["'\`])https?:\\/\\/${esc}(?=\\/|\\1)`, 'g'),
               `$1/__external/${host}`
             );
           }

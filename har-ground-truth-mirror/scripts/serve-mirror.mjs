@@ -2,6 +2,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const args = process.argv.slice(2);
 const getArg = (flag, fallback) => {
@@ -63,6 +64,13 @@ const STREAMABLE_EXTS = new Set([
   '.bin',
   '.glb'
 ]);
+
+function getQueryKeyedRelPath(relPath, search) {
+  if (!search || search === '?') return relPath;
+  const ext = path.extname(relPath);
+  const qHash = crypto.createHash('sha1').update(search).digest('hex').slice(0, 12);
+  return `${relPath}__q_${qHash}${ext}`;
+}
 
 function findApiFixture(fixtureDir, pathname, search, isRSC) {
   if (!fs.existsSync(fixtureDir)) return null;
@@ -140,9 +148,10 @@ function startServer(port) {
       return;
     }
 
-    // 3. Static Asset & Next.js /_next/image Resolution (supporting both decoded & raw encoded paths)
+    // 3. Static Asset & Next.js /_next/image Resolution (supporting both decoded, raw, & query-keyed paths)
     let targetRelPath = pathname.replace(/^\/+/, '');
     const rawRelPath = rawPathname.replace(/^\/+/, '');
+    let assetSearch = parsedUrl.search;
 
     if (pathname === '/_next/image') {
       const imgParam = parsedUrl.searchParams.get('url');
@@ -152,16 +161,30 @@ function startServer(port) {
           try {
             const u = new URL(decoded);
             targetRelPath = path.join('__external', u.hostname, decodeURIComponent(u.pathname).replace(/^\/+/, ''));
+            if (u.search) assetSearch = u.search;
           } catch {
             targetRelPath = decoded.replace(/^\/+/, '');
           }
         } else {
-          targetRelPath = decoded.replace(/^\/+/, '');
+          const qIdx = decoded.indexOf('?');
+          targetRelPath = (qIdx !== -1 ? decoded.slice(0, qIdx) : decoded).replace(/^\/+/, '');
+          if (qIdx !== -1) assetSearch = decoded.slice(qIdx);
         }
       }
     }
 
-    const candidates = [
+    const candidates = [];
+    if (assetSearch && assetSearch !== '?') {
+      const qTarget = getQueryKeyedRelPath(targetRelPath, assetSearch);
+      const qRaw = getQueryKeyedRelPath(rawRelPath, assetSearch);
+      candidates.push(
+        path.join(ROOT_DIR, qTarget),
+        path.join(ROOT_DIR, qRaw),
+        path.join(ROOT_DIR, '__external', qTarget),
+        path.join(ROOT_DIR, '__external', qRaw)
+      );
+    }
+    candidates.push(
       path.join(ROOT_DIR, targetRelPath === '' ? 'index.html' : targetRelPath),
       path.join(ROOT_DIR, rawRelPath === '' ? 'index.html' : rawRelPath),
       path.join(ROOT_DIR, targetRelPath, 'index.css'),
@@ -169,7 +192,7 @@ function startServer(port) {
       path.join(ROOT_DIR, `${targetRelPath}.html`),
       path.join(ROOT_DIR, '__external', targetRelPath),
       path.join(ROOT_DIR, '__external', rawRelPath)
-    ];
+    );
 
     const filePath = candidates.find((f) => fs.existsSync(f) && fs.statSync(f).isFile());
 

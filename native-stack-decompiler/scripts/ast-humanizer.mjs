@@ -416,7 +416,7 @@ export async function humanizeJavaScript(sourceCode, options = {}) {
       unminify: true
     });
     code = cracked.code;
-  } catch {}
+  } catch { }
 
   let ast;
   try {

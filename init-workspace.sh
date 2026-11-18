@@ -11,12 +11,11 @@ echo "📦 Master Vault Root: $VAULT_DIR"
 mkdir -p "$TARGET_PATH/.agent/skills"
 mkdir -p "$TARGET_PATH/.antigravity"
 
-# Symlink strictly the cloning pipeline skills & spatial UI architect
+# Symlink strictly the 3 cloning pipeline skills (zero version skew, zero unrelated skills)
 ln -sfn "$VAULT_DIR/har-ground-truth-mirror" "$TARGET_PATH/.agent/skills/har-ground-truth-mirror"
 ln -sfn "$VAULT_DIR/har-ground-truth-mirror" "$TARGET_PATH/.agent/skills/raw-dom-cloner"
 ln -sfn "$VAULT_DIR/native-stack-decompiler" "$TARGET_PATH/.agent/skills/native-stack-decompiler"
 ln -sfn "$VAULT_DIR/svelte5-stack-converter" "$TARGET_PATH/.agent/skills/svelte5-stack-converter"
-ln -sfn "$VAULT_DIR/spatial-ui-architect" "$TARGET_PATH/.agent/skills/spatial-ui-architect"
 
 mkdir -p "$TARGET_PATH/.agent/rules"
 if [ -f "$VAULT_DIR/pipeline-rules.md" ]; then
