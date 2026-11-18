@@ -199,9 +199,8 @@ async function inspectSurface(page, isLocalAirgap) {
 
     const flushRafBatch = () => {
       nativeRafScheduled = false;
-      if (virtualNowMs < targetVirtualMs) {
-        virtualNowMs = Math.min(targetVirtualMs, virtualNowMs + 16);
-      }
+      if (virtualNowMs >= targetVirtualMs) return;
+      virtualNowMs = Math.min(targetVirtualMs, virtualNowMs + 16);
       const batch = Array.from(pendingRafs.values());
       pendingRafs.clear();
       for (const cb of batch) {
@@ -209,13 +208,17 @@ async function inspectSurface(page, isLocalAirgap) {
           cb(virtualNowMs);
         } catch { }
       }
+      if (pendingRafs.size > 0 && virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
+        nativeRafScheduled = true;
+        origRAF(flushRafBatch);
+      }
     };
 
     window.requestAnimationFrame = (cb) => {
       hasSeenRaf = true;
       const id = nextRafId++;
       pendingRafs.set(id, cb);
-      if (!nativeRafScheduled) {
+      if (virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
         nativeRafScheduled = true;
         origRAF(flushRafBatch);
       }
@@ -226,6 +229,10 @@ async function inspectSurface(page, isLocalAirgap) {
     };
     window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
       targetVirtualMs += deltaMs;
+      if (pendingRafs.size > 0 && virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
+        nativeRafScheduled = true;
+        origRAF(flushRafBatch);
+      }
     };
     window.__AGY_CLOCK_SETTLED__ = () => !hasSeenRaf || pendingRafs.size === 0 || virtualNowMs >= targetVirtualMs;
   });
