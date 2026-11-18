@@ -775,10 +775,9 @@ async function run() {
           }
 
           if (attr.name.toLowerCase() === 'srcset') {
-            const parts = val.split(',').map((p) => p.trim().split(/\s+/)[0]);
-            parts.forEach((p) => {
-              if (p) urls.add(p);
-            });
+            for (const m of val.matchAll(/((?:https?:\/\/|\/)(?:[^\s,]|,(?!\s*(?:https?:\/\/|\/)))+)/g)) {
+              if (m[1]) urls.add(m[1]);
+            }
           }
         }
       }
@@ -801,7 +800,7 @@ async function run() {
 
     for (const m of ssrHtml.matchAll(/(?:data-[a-z0-9-]+|src|poster)=["']([^"']+)["']/gi)) {
       const fullAttr = m[0];
-      const val = m[1].trim();
+      const val = m[1].trim().replace(/&amp;/g, '&');
       if (!val) continue;
       if (
         (fullAttr.includes('basepath') || fullAttr.includes('media-base') || fullAttr.includes('holiday-vat')) &&
@@ -816,8 +815,9 @@ async function run() {
       }
     }
     for (const m of ssrHtml.matchAll(/srcset=["']([^"']+)["']/gi)) {
-      const parts = m[1].split(',').map((p) => p.trim().split(/\s+/)[0]);
-      for (const p of parts) {
+      const decodedSrcset = m[1].replace(/&amp;/g, '&');
+      for (const sm of decodedSrcset.matchAll(/((?:https?:\/\/|\/)(?:[^\s,]|,(?!\s*(?:https?:\/\/|\/)))+)/g)) {
+        const p = sm[1]?.trim();
         if (p && (p.startsWith('/') || p.startsWith('http'))) allUrls.add(p);
       }
     }
@@ -999,8 +999,95 @@ async function run() {
     }
 
     if (modified) {
-      fs.writeFileSync(cssFilePath, cssContent, 'utf8');
+      const newCssBuf = Buffer.from(cssContent, 'utf8');
+      fs.writeFileSync(cssFilePath, newCssBuf);
+      const cssEntry = savedAssets.get(cssOriginalUrl);
+      if (cssEntry) cssEntry.size = newCssBuf.length;
     }
+  }
+
+  const preserveRawBeforeMutating = (absPath, origBuf, newBuf) => {
+    const rel = path.relative(OUT_DIR, absPath);
+    for (const entry of savedAssets.values()) {
+      if (entry.relPath === rel) {
+        const rawRel = 'forensics/raw-assets/' + entry.sha256;
+        const rawAbs = path.join(OUT_DIR, rawRel);
+        fs.mkdirSync(path.dirname(rawAbs), { recursive: true });
+        if (!fs.existsSync(rawAbs)) fs.writeFileSync(rawAbs, origBuf);
+        entry.rawFile = rawRel;
+        entry.size = newBuf.length;
+      }
+    }
+  };
+
+  const externalDir = path.join(OUT_DIR, '__external');
+  if (fs.existsSync(externalDir)) {
+    const mirroredHosts = fs
+      .readdirSync(externalDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+
+    const localizeTree = (dir) => {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (['node_modules', '__sourcemaps__', 'forensics', '__api_fixtures__'].includes(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) localizeTree(full);
+        else if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.mjs'))) {
+          const origBuf = fs.readFileSync(full);
+          const orig = origBuf.toString('utf8');
+          let next = orig;
+          for (const host of mirroredHosts) {
+            const esc = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            next = next.replace(
+              new RegExp(`(["'\`])https?:\\/\\/${esc}(?=\\/|\\1)`, 'g'),
+              `$1/__external/${host}`
+            );
+          }
+          if (mirroredHosts.includes('js.stripe.com')) {
+            next = next.replace(
+              /\^https:\\\/\\\/js\\\.stripe\\\.com(?=\\\/)/g,
+              '^(?:https:\\/\\/js\\.stripe\\.com|(?:https?:\\/\\/[^/]+)?\\/__external\\/js\\.stripe\\.com)'
+            );
+            next = next.replace(
+              /key:"_ensureStripeHosted",value:function\(e\)\{if\(!e\)throw[^}]+\}/g,
+              'key:"_ensureStripeHosted",value:function(){}'
+            );
+          }
+          if (next !== orig) {
+            const newBuf = Buffer.from(next, 'utf8');
+            const commitRewrite = () => {
+              preserveRawBeforeMutating(full, origBuf, newBuf);
+              fs.writeFileSync(full, newBuf);
+            };
+            try {
+              new Function(next);
+              commitRewrite();
+            } catch (syntaxErr) {
+              if (/import statement|Unexpected token ['"]?export/i.test(syntaxErr.message)) {
+                commitRewrite();
+              } else {
+                console.warn(`  ⚠️ Skipped localized JS rewrite due to syntax guard: ${path.relative(OUT_DIR, full)} (${syntaxErr.message})`);
+              }
+            }
+          }
+        } else if (entry.isFile() && entry.name.endsWith('.html') && full.includes(`${path.sep}__external${path.sep}`)) {
+          const origBuf = fs.readFileSync(full);
+          let htmlText = origBuf.toString('utf8');
+          const origText = htmlText;
+          for (const host of mirroredHosts) {
+            htmlText = htmlText.split(`https://${host}/`).join(`/__external/${host}/`);
+          }
+          if (htmlText !== origText) {
+            const newBuf = Buffer.from(htmlText, 'utf8');
+            preserveRawBeforeMutating(full, origBuf, newBuf);
+            fs.writeFileSync(full, newBuf);
+          }
+        }
+      }
+    };
+    localizeTree(OUT_DIR);
+    console.log(`  🔒 Localized ${mirroredHosts.length} external host(s) across replay JS & subframe HTMLs (raw SHA-256 preserved): ${mirroredHosts.join(', ')}`);
   }
 
   const finalRoutesList = routeMetadata.map((r) => r.route);

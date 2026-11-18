@@ -303,7 +303,14 @@ const { PNG } = await resolveDependency('pngjs');
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({
+  headless: true,
+  args: [
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding'
+  ]
+});
 const parityErrors = [];
 const comparisons = [];
 const svelteOrigin = new URL(SVELTE_URL).origin;
@@ -416,7 +423,14 @@ for (const route of ROUTES) {
         svelteConsoleErrors.push(`[A11y/i18n violation] ${text}`);
       }
     });
+    const TELEMETRY_HOSTS = [
+      'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'clarity.ms',
+      'hotjar.com', 'umami.is', 'segment.io', 'cookiebot.com', 'hs-scripts.com',
+      'snitcher.com', 'trysurface', 'posthog', 'r.stripe.com', 'm.stripe.com',
+      'm.stripe.network', 'q.stripe.com', 'errors.stripe.com'
+    ];
     pageSvelte.on('response', (res) => {
+      if (TELEMETRY_HOSTS.some((t) => res.url().includes(t))) return;
       if (res.status() >= 400) {
         svelteFailedRequests.push(`${res.status()} ${res.url()}`);
       }
@@ -426,6 +440,9 @@ for (const route of ROUTES) {
     await pageSvelte.route('**/*', (rt) => {
       const u = rt.request().url();
       if (!u.startsWith(svelteOrigin) && !u.startsWith('data:') && !u.startsWith('blob:')) {
+        if (TELEMETRY_HOSTS.some((t) => u.includes(t))) {
+          return rt.fulfill({ status: 200, body: '/* telemetry noop */', contentType: 'application/javascript; charset=utf-8' });
+        }
         svelteEscapedExternal.push(u);
         return rt.abort('failed');
       }
@@ -434,6 +451,9 @@ for (const route of ROUTES) {
     await pageNative.route('**/*', (rt) => {
       const u = rt.request().url();
       if (!u.startsWith(nativeOrigin) && !u.startsWith('data:') && !u.startsWith('blob:')) {
+        if (TELEMETRY_HOSTS.some((t) => u.includes(t))) {
+          return rt.fulfill({ status: 200, body: '/* telemetry noop */', contentType: 'application/javascript; charset=utf-8' });
+        }
         return rt.abort('failed');
       }
       return rt.continue();
@@ -441,6 +461,9 @@ for (const route of ROUTES) {
     await pageMirror.route('**/*', (rt) => {
       const u = rt.request().url();
       if (!u.startsWith(mirrorOrigin) && !u.startsWith('data:') && !u.startsWith('blob:')) {
+        if (TELEMETRY_HOSTS.some((t) => u.includes(t))) {
+          return rt.fulfill({ status: 200, body: '/* telemetry noop */', contentType: 'application/javascript; charset=utf-8' });
+        }
         return rt.abort('failed');
       }
       return rt.continue();

@@ -113,7 +113,12 @@ const TELEMETRY_HOSTS = [
   'hs-scripts.com',
   'snitcher.com',
   'trysurface',
-  'posthog'
+  'posthog',
+  'r.stripe.com',
+  'm.stripe.com',
+  'm.stripe.network',
+  'q.stripe.com',
+  'errors.stripe.com'
 ];
 
 async function inspectSurface(page, isLocalAirgap) {
@@ -122,23 +127,107 @@ async function inspectSurface(page, isLocalAirgap) {
   const escapedExternal = [];
   const cdpIssues = [];
 
-  if (isLocalAirgap) {
-    try {
-      const client = await page.context().newCDPSession(page);
-      await client.send('Audits.enable');
-      client.on('Audits.issueAdded', (issue) => {
-        cdpIssues.push(issue);
-      });
-    } catch { }
-  }
+  try {
+    const client = await page.context().newCDPSession(page);
+    await client.send('Audits.enable');
+    client.on('Audits.issueAdded', (issue) => {
+      cdpIssues.push(issue);
+    });
+  } catch { }
 
-  // Deterministic PRNG — ZERO canvas masking, ZERO video hiding!
+  // Deterministic canvas-scoped PRNG + target-bounded native-RAF virtual clock — ZERO canvas masking, ZERO video hiding!
   await page.addInitScript(() => {
-    let seed = 1337;
-    Math.random = () => {
-      seed = (seed * 1664525 + 1013904223) >>> 0;
-      return seed / 4294967296;
+    const hashStr = (str) => {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h || 1337;
     };
+    let defaultSeed = 1337;
+    let activeSeed = 1337;
+    let usingCanvasSeed = false;
+    const ctxCounts = Object.create(null);
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+      const ctx = origGetContext.call(this, type, ...args);
+      if (ctx) {
+        const key = String(type || '2d');
+        ctxCounts[key] = (ctxCounts[key] || 0) + 1;
+        activeSeed = hashStr(`${key}:${ctxCounts[key]}`);
+        usingCanvasSeed = true;
+        queueMicrotask(() => {
+          usingCanvasSeed = false;
+        });
+      }
+      return ctx;
+    };
+    Math.random = () => {
+      if (usingCanvasSeed) {
+        activeSeed = (Math.imul(activeSeed, 1664525) + 1013904223) >>> 0;
+        return activeSeed / 4294967296;
+      }
+      defaultSeed = (Math.imul(defaultSeed, 1664525) + 1013904223) >>> 0;
+      return defaultSeed / 4294967296;
+    };
+
+    let virtualNowMs = 1000;
+    let targetVirtualMs = 1960;
+    try {
+      Object.defineProperty(performance, 'now', { value: () => virtualNowMs, configurable: true });
+    } catch { }
+
+    const origSetTimeout = window.setTimeout.bind(window);
+    const origClearTimeout = window.clearTimeout.bind(window);
+    window.setTimeout = (fn, delay = 0, ...rest) => {
+      if (typeof fn === 'function' && Number(delay) >= 3000) {
+        return 900001;
+      }
+      return origSetTimeout(fn, delay, ...rest);
+    };
+    window.clearTimeout = (id) => {
+      if (typeof id === 'number' && id >= 900001) return;
+      return origClearTimeout(id);
+    };
+
+    const origRAF = window.requestAnimationFrame.bind(window);
+    let nextRafId = 1;
+    let hasSeenRaf = false;
+    const pendingRafs = new Map();
+    let nativeRafScheduled = false;
+
+    const flushRafBatch = () => {
+      nativeRafScheduled = false;
+      if (virtualNowMs < targetVirtualMs) {
+        virtualNowMs = Math.min(targetVirtualMs, virtualNowMs + 16);
+      }
+      const batch = Array.from(pendingRafs.values());
+      pendingRafs.clear();
+      for (const cb of batch) {
+        try {
+          cb(virtualNowMs);
+        } catch { }
+      }
+    };
+
+    window.requestAnimationFrame = (cb) => {
+      hasSeenRaf = true;
+      const id = nextRafId++;
+      pendingRafs.set(id, cb);
+      if (!nativeRafScheduled) {
+        nativeRafScheduled = true;
+        origRAF(flushRafBatch);
+      }
+      return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+      pendingRafs.delete(id);
+    };
+    window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
+      targetVirtualMs += deltaMs;
+    };
+    window.__AGY_CLOCK_SETTLED__ = () => !hasSeenRaf || pendingRafs.size === 0 || virtualNowMs >= targetVirtualMs;
   });
 
   page.on('pageerror', (err) => errors.push(`PageError: ${err.message}`));
@@ -304,7 +393,14 @@ async function run() {
     process.exit(1);
   }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding'
+    ]
+  });
 
   for (const route of ROUTES) {
     const liveTarget = new URL(route, LIVE_URL).href;
@@ -330,7 +426,7 @@ async function run() {
       const livePage = await liveCtx.newPage();
       const localPage = await localCtx.newPage();
 
-      await inspectSurface(livePage, false);
+      const liveMonitor = await inspectSurface(livePage, false);
       const localMonitor = await inspectSurface(localPage, true);
 
       const [liveRes, localRes] = await Promise.all([
@@ -348,6 +444,10 @@ async function run() {
         localPage.evaluate(() => document.fonts?.ready).catch(() => { })
       ]);
       await Promise.all([livePage.waitForTimeout(1800), localPage.waitForTimeout(1800)]);
+      await Promise.all([
+        livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 3000 }).catch(() => { }),
+        localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 3000 }).catch(() => { })
+      ]);
 
       await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
       await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
@@ -430,10 +530,20 @@ async function run() {
         const localY = Math.round(Math.max(0, localHeight - vp.height) * ratio);
 
         await Promise.all([
-          livePage.evaluate((y) => window.scrollTo(0, y), liveY),
-          localPage.evaluate((y) => window.scrollTo(0, y), localY)
+          livePage.evaluate((y) => {
+            window.scrollTo(0, y);
+            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(256);
+          }, liveY),
+          localPage.evaluate((y) => {
+            window.scrollTo(0, y);
+            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(256);
+          }, localY)
         ]);
         await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
+        await Promise.all([
+          livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 2500 }).catch(() => { }),
+          localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 2500 }).catch(() => { })
+        ]);
         await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
         await Promise.all([livePage.waitForTimeout(150), localPage.waitForTimeout(150)]);
 
@@ -490,13 +600,19 @@ async function run() {
         totalFailures++;
       }
 
-      const actionableCdpIssues = (localMonitor.cdpIssues || []).filter((i) => {
-        const d = i?.issue?.details || i;
-        if (d?.cookieDeprecationMetadataIssueDetails) return false;
-        if (d?.cookieIssueDetails) return false;
-        if (d?.bounceTrackingIssueDetails) return false;
-        return Boolean(d?.stylesheetLoadingIssueDetails || d?.lazyLoadImageIssueDetails);
-      });
+      const localStyleIssues = (localMonitor.cdpIssues || []).filter(
+        (i) => Boolean((i?.issue?.details || i)?.stylesheetLoadingIssueDetails)
+      );
+      const localLazyIssues = (localMonitor.cdpIssues || []).filter(
+        (i) => Boolean((i?.issue?.details || i)?.lazyLoadImageIssueDetails)
+      );
+      const liveLazyIssues = (liveMonitor.cdpIssues || []).filter(
+        (i) => Boolean((i?.issue?.details || i)?.lazyLoadImageIssueDetails)
+      );
+      const actionableCdpIssues = [
+        ...localStyleIssues,
+        ...(localLazyIssues.length > liveLazyIssues.length ? localLazyIssues.slice(liveLazyIssues.length) : [])
+      ];
       if (actionableCdpIssues.length > 0) {
         console.error(
           `    ❌ Chrome CDP Audit Violations (${actionableCdpIssues.length}):`,

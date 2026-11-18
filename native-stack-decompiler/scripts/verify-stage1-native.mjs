@@ -97,7 +97,12 @@ const TELEMETRY_HOSTS = [
   'hs-scripts.com',
   'snitcher.com',
   'trysurface',
-  'posthog'
+  'posthog',
+  'r.stripe.com',
+  'm.stripe.com',
+  'm.stripe.network',
+  'q.stripe.com',
+  'errors.stripe.com'
 ];
 
 async function inspectSurface(page, expectedOrigin, checkScriptProvenance) {
@@ -271,7 +276,14 @@ async function run() {
   console.log(`GATE 2: Unmasked Visual, Kinetic & Living Parity (:3010 vs :3011)`);
   console.log(`============================================================`);
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding'
+    ]
+  });
   let totalFailures = 0;
   const parityMetrics = [];
   const livingViolations = [];
