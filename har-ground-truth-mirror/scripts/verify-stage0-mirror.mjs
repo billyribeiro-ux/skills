@@ -148,14 +148,18 @@ async function inspectSurface(page, isLocalAirgap) {
     let defaultSeed = 1337;
     let activeSeed = 1337;
     let usingCanvasSeed = false;
-    const ctxCounts = Object.create(null);
     const origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = function (type, ...args) {
       const ctx = origGetContext.call(this, type, ...args);
       if (ctx) {
         const key = String(type || '2d');
-        ctxCounts[key] = (ctxCounts[key] || 0) + 1;
-        activeSeed = hashStr(`${key}:${ctxCounts[key]}`);
+        let sig = `${key}:offscreen:${this.width}x${this.height}`;
+        if (this.isConnected) {
+          const r = this.getBoundingClientRect();
+          const bucketY = Math.round((r.top + window.scrollY) / 100);
+          sig = `${key}:y${bucketY}:${Math.round(r.width)}x${Math.round(r.height)}`;
+        }
+        activeSeed = hashStr(sig);
         usingCanvasSeed = true;
         queueMicrotask(() => {
           usingCanvasSeed = false;
