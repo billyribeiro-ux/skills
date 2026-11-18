@@ -177,7 +177,6 @@ async function inspectSurface(page, isLocalAirgap) {
     };
 
     let virtualNowMs = 1000;
-    let targetVirtualMs = 1000;
     try {
       Object.defineProperty(performance, 'now', { value: () => virtualNowMs, configurable: true });
     } catch { }
@@ -195,50 +194,32 @@ async function inspectSurface(page, isLocalAirgap) {
       return origClearTimeout(id);
     };
 
-    const origRAF = window.requestAnimationFrame.bind(window);
     let nextRafId = 1;
-    let hasSeenRaf = false;
     const pendingRafs = new Map();
-    let nativeRafScheduled = false;
-
-    const flushRafBatch = () => {
-      nativeRafScheduled = false;
-      if (virtualNowMs >= targetVirtualMs) return;
-      virtualNowMs = Math.min(targetVirtualMs, virtualNowMs + 16);
-      const batch = Array.from(pendingRafs.values());
-      pendingRafs.clear();
-      for (const cb of batch) {
-        try {
-          cb(virtualNowMs);
-        } catch { }
-      }
-      if (pendingRafs.size > 0 && virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
-        nativeRafScheduled = true;
-        origRAF(flushRafBatch);
-      }
-    };
 
     window.requestAnimationFrame = (cb) => {
-      hasSeenRaf = true;
       const id = nextRafId++;
       pendingRafs.set(id, cb);
-      if (virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
-        nativeRafScheduled = true;
-        origRAF(flushRafBatch);
-      }
       return id;
     };
     window.cancelAnimationFrame = (id) => {
       pendingRafs.delete(id);
     };
     window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
-      targetVirtualMs += deltaMs;
-      if (pendingRafs.size > 0 && virtualNowMs < targetVirtualMs && !nativeRafScheduled) {
-        nativeRafScheduled = true;
-        origRAF(flushRafBatch);
+      const end = virtualNowMs + deltaMs;
+      while (virtualNowMs < end && pendingRafs.size > 0) {
+        virtualNowMs = Math.min(end, virtualNowMs + 16);
+        const batch = Array.from(pendingRafs.values());
+        pendingRafs.clear();
+        for (const cb of batch) {
+          try {
+            cb(virtualNowMs);
+          } catch { }
+        }
       }
+      virtualNowMs = end;
     };
-    window.__AGY_CLOCK_SETTLED__ = () => !hasSeenRaf || pendingRafs.size === 0 || virtualNowMs >= targetVirtualMs;
+    window.__AGY_CLOCK_SETTLED__ = () => true;
   });
 
   page.on('pageerror', (err) => errors.push(`PageError: ${err.message}`));
@@ -467,6 +448,11 @@ async function run() {
         totalFailures++;
       }
 
+      await Promise.all([livePage.waitForTimeout(500), localPage.waitForTimeout(500)]);
+      await Promise.all([
+        livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { }),
+        localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { })
+      ]);
       await Promise.all([
         livePage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { }),
         localPage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { })
