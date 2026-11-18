@@ -272,48 +272,44 @@ export function convertJsxSourceToSvelte(code, options = {}) {
     return null;
   }
 
-  let propsParam = null;
-  let returnNode = null;
-  const scriptStatements = [];
-
-  traverse(ast, {
-    FunctionDeclaration(p) {
-      if (!returnNode) {
-        propsParam = p.node.params[0] || null;
-        for (const stmt of p.node.body.body) {
-          if (stmt.type === 'ReturnStatement') returnNode = stmt.argument;
-          else if (!isEarlyReturn(stmt)) scriptStatements.push(stmt);
-        }
-      }
-    },
-    FunctionExpression(p) {
-      if (!returnNode && p.parent.type === 'VariableDeclarator') {
-        propsParam = p.node.params[0] || null;
-        for (const stmt of p.node.body.body) {
-          if (stmt.type === 'ReturnStatement') returnNode = stmt.argument;
-          else if (!isEarlyReturn(stmt)) scriptStatements.push(stmt);
-        }
-      }
-    },
-    ArrowFunctionExpression(p) {
-      if (!returnNode && p.parent.type === 'VariableDeclarator') {
-        propsParam = p.node.params[0] || null;
-        if (p.node.body.type === 'BlockStatement') {
-          for (const stmt of p.node.body.body) {
-            if (stmt.type === 'ReturnStatement') returnNode = stmt.argument;
-            else if (!isEarlyReturn(stmt)) scriptStatements.push(stmt);
-          }
-        } else {
-          returnNode = p.node.body;
-        }
+  const declarations = ast.program.body;
+  const exported = declarations.find((entry) => entry.type === 'ExportDefaultDeclaration');
+  let component = exported?.declaration;
+  const lookup = component?.type === 'Identifier' ? component.name : options.name;
+  if (!component || component.type === 'Identifier') {
+    for (const entry of declarations) {
+      const declaration = entry.declaration ?? entry;
+      if (declaration.type === 'FunctionDeclaration' && declaration.id.name === lookup) component = declaration;
+      if (declaration.type === 'VariableDeclaration') {
+        const variable = declaration.declarations.find((d) => d.id.name === lookup);
+        if (variable) component = variable.init;
       }
     }
+  }
+  if (!component || !['ArrowFunctionExpression', 'FunctionDeclaration', 'FunctionExpression'].includes(component.type)) return null;
+  const propsParam = component.params[0];
+  const body = component.body;
+  const statements = body.type === 'BlockStatement' ? body.body : [];
+  const returnNode = body.type === 'BlockStatement' ? statements.at(-1)?.argument : body;
+  if (!returnNode || statements.slice(0, -1).some(isEarlyReturn)) return null;
+  const scriptStatements = statements.slice(0, -1);
+  const imports = [];
+  for (const entry of declarations) {
+    if (entry.type !== 'ImportDeclaration') continue;
+    if (['react', 'framer-motion', 'motion/react'].includes(entry.source.value)) continue;
+    if (options.resolveImport) entry.source.value = options.resolveImport(entry.source.value);
+    imports.push(generate(entry).code);
+  }
+  const localStatements = declarations.flatMap((entry) => {
+    const decl = entry.declaration ?? entry;
+    if (entry.type === 'ImportDeclaration' || entry === exported || decl === component) return [];
+    if (decl.type === 'VariableDeclaration' && decl.declarations.some((item) => item.init === component)) return [];
+    if (['VariableDeclaration','FunctionDeclaration','TSTypeAliasDeclaration','TSInterfaceDeclaration'].includes(decl.type)) return [generate(decl).code];
+    return [];
   });
 
-  if (!returnNode) return null;
-
   const propsFields = [];
-  let propsDestructure = '{ children, class: className = "", ...restProps }';
+  let propsDestructure = propsParam?.type === 'Identifier' ? propsParam.name : '{ children, class: className = "", ...restProps }';
   if (propsParam && propsParam.type === 'ObjectPattern') {
     const destructureItems = [];
     for (const prop of propsParam.properties) {
@@ -342,8 +338,8 @@ export function convertJsxSourceToSvelte(code, options = {}) {
     .map((stmt) => {
       let raw = generate(stmt).code;
       raw = raw.replace(
-        /(?:const|let)\s+\[([a-zA-Z0-9_]+),\s*set[a-zA-Z0-9_]+\]\s*=\s*(?:[a-zA-Z0-9_]+\.)?useState\(([^)]*)\);?/g,
-        'let $1 = $state($2);'
+        /(?:const|let)\s+\[([a-zA-Z0-9_]+),\s*([a-zA-Z0-9_]+)\]\s*=\s*(?:[a-zA-Z0-9_]+\.)?useState\(([^)]*)\);?/g,
+        (_, name, setter, initial) => `let ${name} = $state(${initial});\n  function ${setter}(${name}Update: typeof ${name} | ((${name}Before: typeof ${name}) => typeof ${name})) { ${name} = typeof ${name}Update === "function" ? ${name}Update(${name}) : ${name}Update; }`
       );
       raw = raw.replace(
         /(?:const|let)\s+([a-zA-Z0-9_]+)\s*=\s*(?:[a-zA-Z0-9_]+\.)?useRef\(([^)]*)\);?/g,
@@ -376,6 +372,8 @@ export function convertJsxSourceToSvelte(code, options = {}) {
 
   const scriptBlock = [
     '<script lang="ts">',
+    ...imports,
+    ...localStatements,
     usesChildren ? "  import type { Snippet } from 'svelte';" : null,
     ctx.usesMotion ? "  import { animateMotion } from '#lib/motion/motionAttachment.js';" : null,
     '',

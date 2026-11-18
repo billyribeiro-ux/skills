@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { chromium } from 'playwright';
+import { parse } from '@babel/parser';
 import { extractCdpForensics } from './extract-cdp-forensics.mjs';
 
 const args = process.argv.slice(2);
@@ -15,11 +16,12 @@ const hasFlag = (flag) => args.includes(flag);
 const targetUrlStr = getArg('--url', process.env.TARGET_URL);
 if (!targetUrlStr) {
   console.error(
-    'Usage: node capture-mirror.mjs --url <URL> [--routes /route1,/route2] [--out-dir ./00-mirror] [--max-routes 25] [--single-route] [--skip-cdp-forensics]'
+    'Usage: node capture-mirror.mjs --url <URL> [--routes /route1,/route2] [--out-dir ./00-mirror] [--max-routes N] [--single-route] [--skip-cdp-forensics]'
   );
   process.exit(1);
 }
 
+const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const targetBaseUrl = new URL(targetUrlStr);
 const targetHost = targetBaseUrl.hostname.replace(/^www\./, '');
 const targetOrigin = targetBaseUrl.origin;
@@ -37,7 +39,7 @@ if (routesFile && fs.existsSync(routesFile)) {
 } else if (routesArg) {
   specifiedRoutes = routesArg.split(',').map((r) => r.trim()).filter(Boolean);
 } else {
-  specifiedRoutes = [targetBaseUrl.pathname || '/'];
+  specifiedRoutes = [targetBaseUrl.pathname + targetBaseUrl.search];
 }
 
 // Auto-discover internal routes by default unless explicitly restricted
@@ -45,7 +47,8 @@ const discoverRoutes =
   !hasFlag('--single-route') && !hasFlag('--no-discover-routes') && !routesArg && !routesFile
     ? true
     : hasFlag('--discover-routes');
-const maxRoutes = parseInt(getArg('--max-routes', '25'), 10);
+const maxRoutes = Number(getArg('--max-routes', 'Infinity'));
+if (maxRoutes !== Infinity && (!Number.isInteger(maxRoutes) || maxRoutes < 1)) throw new Error('Invalid --max-routes');
 const skipCdpForensics = hasFlag('--skip-cdp-forensics');
 
 console.log(`🌐 Target: ${targetBaseUrl.href}`);
@@ -217,20 +220,18 @@ function getLocalPathForUrl(urlStr, contentType = '') {
     if (contentType.includes('text/css') && !path.extname(cleanPath)) {
       cleanPath = path.join(cleanPath, 'index.css');
     }
-    if (host === targetHost) {
+    if (cleanPath.split(/[\\/]/).some((part) => part === '..') || cleanPath.includes('\0')) return null;
+    if (u.search) {
+      const ext = path.extname(cleanPath);
+      cleanPath = cleanPath.slice(0, cleanPath.length - ext.length) + '~' + sha256(u.search) + ext;
+    }
+    if (host === targetHost && u.port === targetBaseUrl.port) {
       return cleanPath;
     }
-    return path.join('__external', u.hostname, cleanPath);
+    return path.join('__external', u.host, cleanPath);
   } catch {
     return null;
   }
-}
-
-function getQueryKeyedRelPath(relPath, search) {
-  if (!search || search === '?') return relPath;
-  const ext = path.extname(relPath);
-  const qHash = crypto.createHash('sha1').update(search).digest('hex').slice(0, 12);
-  return `${relPath}__q_${qHash}${ext}`;
 }
 
 function writeAssetSafely(outPath, buf) {
@@ -255,32 +256,43 @@ function writeAssetSafely(outPath, buf) {
 }
 
 async function probeAndHarvestSourceMap(urlStr, headers, bodyBuf) {
+  const pathname = new URL(urlStr).pathname;
+  let ref = headers['sourcemap'] || headers['x-sourcemap'];
+  if (!ref && /\.(?:[cm]?js|css)$/i.test(pathname)) {
+    const refs = Array.from(bodyBuf.toString('utf8').matchAll(/(?:\/\/[#@]\s*sourceMappingURL=([^\s'"]+)|\/\*#\s*sourceMappingURL=([^\s*]+)\s*\*\/)/g));
+    const last = refs.at(-1);
+    ref = last?.[1] || last?.[2];
+  }
+  if (!ref) return;
+  const inline = /^data:/i.test(ref);
+  const mapUrl = inline ? urlStr : new URL(ref, urlStr).href;
   try {
-    let sourceMapUrl = headers['sourcemap'] || headers['x-sourcemap'];
-    if (!sourceMapUrl && bodyBuf && (urlStr.endsWith('.js') || urlStr.endsWith('.css'))) {
-      const text = bodyBuf.toString('utf8');
-      const match =
-        text.match(/\/\/[#@]\s*sourceMappingURL=([^\s'"]+)/) ||
-        text.match(/\/\*#\s*sourceMappingURL=([^\s'"]+)\s*\*\//);
-      if (match) sourceMapUrl = match[1];
+    let bytes;
+    if (inline) {
+      const comma = ref.indexOf(',');
+      if (comma < 0) throw new Error('Malformed inline source map');
+      const data = decodeURIComponent(ref.slice(comma + 1));
+      bytes = Buffer.from(data, /;base64(?:;|$)/i.test(ref.slice(0, comma)) ? 'base64' : 'utf8');
+    } else {
+      if (!/^https?:/.test(mapUrl)) throw new Error('Unsupported map URL scheme');
+      const response = await fetch(mapUrl, {headers: {'User-Agent': USER_AGENT}});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      bytes = Buffer.from(await response.arrayBuffer());
     }
-    if (sourceMapUrl && !sourceMapUrl.startsWith('data:')) {
-      const resolvedMapUrl = new URL(sourceMapUrl, urlStr).href;
-      const res = await fetch(resolvedMapUrl, { headers: { 'User-Agent': USER_AGENT } }).catch(() => null);
-      if (res && res.ok && res.status === 200) {
-        const mapText = await res.text();
-        try {
-          JSON.parse(mapText);
-          const u = new URL(urlStr);
-          const safeName = `${u.pathname.replace(/^\/+/, '').replace(/\//g, '__')}.map`;
-          fs.writeFileSync(path.join(SOURCEMAPS_DIR, safeName), mapText, 'utf8');
-          console.log(`  🗺️ Harvested SourceMap: ${safeName} (${(mapText.length / 1024).toFixed(1)} KB)`);
-        } catch { }
-      }
-    }
-  } catch { }
+    const parsed = JSON.parse(bytes.toString('utf8'));
+    if (parsed.version !== 3 || !(Array.isArray(parsed.sources) || Array.isArray(parsed.sections))) throw new Error('Invalid v3 source map');
+    const digest = sha256(bytes);
+    const file = '__sourcemaps__/' + digest + '.map';
+    fs.writeFileSync(path.join(OUT_DIR, file), bytes);
+    sourceMaps.set(urlStr, {scriptUrl: urlStr, mapUrl, inline, file, sha256: digest, firstParty: new URL(urlStr).hostname.replace(/^www\./, '') === targetHost});
+  } catch (error) {
+    mapFailures.set(urlStr, {scriptUrl: urlStr, mapUrl, reason: error.message});
+  }
+
 }
 
+const sourceMaps = new Map();
+const mapFailures = new Map();
 const savedAssets = new Map();
 const capturedCssFiles = new Map();
 const capturedJsFiles = new Map();
@@ -291,8 +303,25 @@ const discoveredRoutes = new Set(specifiedRoutes);
 const stackClassification = {};
 const routeMetadata = [];
 
+function recordAsset(url, replayFile, raw, contentType, replayBytes = raw) {
+  const relPath = path.relative(OUT_DIR, replayFile);
+  const digest = sha256(raw);
+  // CSS may be localized after download. Keep that evidence before any pass mutates it.
+  const keepOriginal = contentType.includes('text/css') || relPath.endsWith('.css') || !replayBytes.equals(raw);
+  let rawFile = relPath;
+  if (keepOriginal) {
+    rawFile = 'forensics/raw-assets/' + digest;
+    const absolute = path.join(OUT_DIR, rawFile);
+    fs.mkdirSync(path.dirname(absolute), {recursive: true});
+    if (!fs.existsSync(absolute)) fs.writeFileSync(absolute, raw);
+  }
+  savedAssets.set(url, {relPath, size: replayBytes.length, rawFile, sha256: digest, contentType});
+}
+
 async function downloadFullAsset(urlStr) {
-  if (savedAssets.has(urlStr) || isTracker(urlStr)) return true;
+  urlStr = urlStr.split('#', 1)[0];
+  if (savedAssets.has(urlStr)) return true;
+  if (isTracker(urlStr)) return false;
   try {
     const res = await fetch(urlStr, { headers: { 'User-Agent': USER_AGENT } });
     if (!res.ok || res.status !== 200) return false;
@@ -304,34 +333,25 @@ async function downloadFullAsset(urlStr) {
     if (!buf || buf.length === 0) return false;
     if (!validateMagicBytes(buf, ext)) return false;
 
+    const finalPath = writeAssetSafely(path.join(OUT_DIR, relPath), buf);
     const parsedU = new URL(urlStr);
-    const queryRelPath = getQueryKeyedRelPath(relPath, parsedU.search);
-    const writeTarget = queryRelPath !== relPath ? queryRelPath : relPath;
-    const finalPath = writeAssetSafely(path.join(OUT_DIR, writeTarget), buf);
-    if (queryRelPath !== relPath && !fs.existsSync(path.join(OUT_DIR, relPath))) {
-      writeAssetSafely(path.join(OUT_DIR, relPath), buf);
-    }
-    if (parsedU.pathname !== decodeURIComponent(parsedU.pathname)) {
+    if (!parsedU.search && parsedU.pathname !== decodeURIComponent(parsedU.pathname)) {
       const rawClean = parsedU.pathname.replace(/^\/+/, '');
       const rawRel =
         parsedU.hostname.replace(/^www\./, '') === targetHost
           ? rawClean
           : path.join('__external', parsedU.hostname, rawClean);
       if (rawRel !== relPath) {
-        const rawQueryRel = getQueryKeyedRelPath(rawRel, parsedU.search);
-        writeAssetSafely(path.join(OUT_DIR, rawQueryRel), buf);
-        if (rawQueryRel !== rawRel && !fs.existsSync(path.join(OUT_DIR, rawRel))) {
-          writeAssetSafely(path.join(OUT_DIR, rawRel), buf);
-        }
+        writeAssetSafely(path.join(OUT_DIR, rawRel), buf);
       }
     }
 
-    savedAssets.set(urlStr, { relPath: path.relative(OUT_DIR, finalPath), size: buf.length });
+    recordAsset(urlStr, finalPath, buf, contentType);
     if (ext === '.css' || contentType.includes('text/css')) {
       capturedCssFiles.set(finalPath, urlStr);
     }
-    if (ext === '.js' || ext === '.mjs') {
-      capturedJsFiles.set(finalPath, urlStr);
+    if (ext === '.js' || ext === '.mjs') capturedJsFiles.set(finalPath, urlStr);
+    if (/\.(?:[cm]?js|css)$/.test(ext)) {
       await probeAndHarvestSourceMap(urlStr, Object.fromEntries(res.headers.entries()), buf);
     }
     return true;
@@ -340,11 +360,50 @@ async function downloadFullAsset(urlStr) {
   }
 }
 
+// Use the deployed module URL as the base for literal ESM imports and import.meta.url assets.
+function moduleReferences(code, moduleUrl) {
+  const refs = new Set();
+  if (!/\b(?:import|export)\b/.test(code)) return refs;
+  let ast;
+  try {
+    ast = parse(code, {sourceType: 'unambiguous', createImportExpressions: true});
+  } catch {
+    return refs;
+  }
+  const queue = [ast.program];
+  while (queue.length) {
+    const node = queue.pop();
+    let source;
+    if (['ImportDeclaration', 'ExportAllDeclaration', 'ExportNamedDeclaration', 'ImportExpression'].includes(node.type)) {
+      source = node.source;
+    } else if (node.type === 'NewExpression' && node.callee?.name === 'URL') {
+      const base = node.arguments[1];
+      if (base?.type === 'MemberExpression' && base.property?.name === 'url' &&
+          base.object?.type === 'MetaProperty' && base.object.meta?.name === 'import') {
+        source = node.arguments[0];
+      }
+    }
+    if (source?.type === 'StringLiteral' && (node.type === 'NewExpression' || /^(?:\.{1,2}\/|\/|https?:\/\/)/.test(source.value))) {
+      const resolved = new URL(source.value, moduleUrl);
+      resolved.hash = '';
+      if (/^https?:$/.test(resolved.protocol)) refs.add(resolved.href);
+    }
+    for (const child of Object.values(node)) {
+      if (Array.isArray(child)) {
+        for (const member of child) if (member?.type) queue.push(member);
+      } else if (child?.type) {
+        queue.push(child);
+      }
+    }
+  }
+  return refs;
+}
+
 async function harvestDynamicBundlerChunks() {
   const visitedJs = new Set();
   let pass = 0;
 
-  while (pass < 4) {
+  while (true) {
     pass++;
     let newlyDownloaded = 0;
     const entries = Array.from(capturedJsFiles.entries());
@@ -354,7 +413,7 @@ async function harvestDynamicBundlerChunks() {
       visitedJs.add(jsPath);
 
       const code = fs.readFileSync(jsPath, 'utf8');
-      const chunkCandidates = new Set();
+      const chunkCandidates = moduleReferences(code, originalUrl);
 
       const explicitRegex =
         /["'`](\/(?:_next\/static\/(?:immutable\/)?chunks|_next\/static\/css|_astro|_nuxt|assets)\/[a-zA-Z0-9._/-]+\.(?:js|mjs|css|wasm))["'`]/g;
@@ -459,10 +518,8 @@ async function mirrorHlsPlaylistTree(playlistUrl, visitedPlaylists = new Set()) 
         path.join(OUT_DIR, localPlaylistRel),
         Buffer.from(rewrittenLines.join('\n'), 'utf8')
       );
-      savedAssets.set(playlistUrl, {
-        relPath: path.relative(OUT_DIR, outPath),
-        size: rewrittenLines.join('\n').length
-      });
+      recordAsset(playlistUrl, outPath, Buffer.from(rawText), 'application/vnd.apple.mpegurl', Buffer.from(rewrittenLines.join('\n')));
+
     }
 
     const CONCURRENCY = 8;
@@ -491,7 +548,8 @@ async function run() {
 
   const page = await context.newPage();
 
-  page.on('response', async (response) => {
+  const pendingResponses = new Set();
+  const captureResponse = async (response) => {
     try {
       const urlStr = response.url();
       if (!urlStr.startsWith('http') || isTracker(urlStr)) return;
@@ -508,37 +566,19 @@ async function run() {
         return;
       }
 
-      if (response.request().resourceType() === 'document') {
-        const isSubFrame = response.request().frame() && response.request().frame() !== page.mainFrame();
-        if (isSubFrame && u.hostname.replace(/^www\./, '') !== targetHost) {
-          const docBuf = await response.body().catch(() => null);
-          const docRel = getLocalPathForUrl(urlStr, contentType);
-          if (docBuf && docRel) {
-            writeAssetSafely(path.join(OUT_DIR, docRel), docBuf);
-            savedAssets.set(urlStr, { relPath: docRel, size: docBuf.length });
-          }
-        }
-        return;
-      }
+      if (response.request().method() !== 'GET' || response.request().resourceType() === 'document') return;
 
       if (isRSC || contentType.includes('application/json')) {
         const bodyBuf = await response.body().catch(() => null);
         if (bodyBuf && bodyBuf.length > 0) {
-          if (u.hostname.replace(/^www\./, '') !== targetHost) {
-            const extJsonRel = getLocalPathForUrl(urlStr, contentType);
-            if (extJsonRel) {
-              writeAssetSafely(path.join(OUT_DIR, extJsonRel), bodyBuf);
-              savedAssets.set(urlStr, { relPath: extJsonRel, size: bodyBuf.length });
-            }
-          }
           const fixtureKey = `${u.pathname}${u.search}`;
-          const safeFileName = `${u.pathname.replace(/^\/+/, '').replace(/\//g, '__') || 'root'}${u.search ? '__' + Buffer.from(u.search).toString('hex').slice(0, 16) : ''
-            }.${isRSC ? 'rsc' : 'json'}`;
+          const safeFileName = sha256(urlStr) + (isRSC ? '.rsc' : '.json');
           const fixturePath = path.join(OUT_DIR, '__api_fixtures__', safeFileName);
           fs.writeFileSync(fixturePath, bodyBuf);
           apiFixtures.push({
             url: urlStr,
             fixtureKey,
+            isRSC,
             file: path.relative(OUT_DIR, fixturePath),
             size: bodyBuf.length
           });
@@ -577,13 +617,8 @@ async function run() {
         finalBuf = Buffer.from('/* metrics auto-init disabled for air-gapped parity */\n', 'utf8');
       }
 
-      const queryRelPath = getQueryKeyedRelPath(relPath, u.search);
-      const writeTarget = queryRelPath !== relPath ? queryRelPath : relPath;
-      const outPath = writeAssetSafely(path.join(OUT_DIR, writeTarget), finalBuf);
-      if (queryRelPath !== relPath && !fs.existsSync(path.join(OUT_DIR, relPath))) {
-        writeAssetSafely(path.join(OUT_DIR, relPath), finalBuf);
-      }
-      savedAssets.set(urlStr, { relPath: path.relative(OUT_DIR, outPath), size: finalBuf.length });
+      const outPath = writeAssetSafely(path.join(OUT_DIR, relPath), finalBuf);
+      recordAsset(urlStr, outPath, bodyBuf, contentType, finalBuf);
 
       if (ext === '.css' || contentType.includes('text/css')) {
         capturedCssFiles.set(outPath, urlStr);
@@ -591,10 +626,16 @@ async function run() {
       if (ext === '.js' || ext === '.mjs') {
         capturedJsFiles.set(outPath, urlStr);
       }
-      if (ext === '.js' || ext === '.css') {
+      if (/\.(?:[cm]?js|css)$/.test(ext)) {
         await probeAndHarvestSourceMap(urlStr, response.headers(), finalBuf);
       }
-    } catch { }
+    } catch (error) {
+      console.warn('Could not capture response:', response.url(), error.message);
+    }
+  };
+  context.on('response', (response) => {
+    const work = captureResponse(response).finally(() => pendingResponses.delete(work));
+    pendingResponses.add(work);
   });
 
   const viewports = [
@@ -619,7 +660,12 @@ async function run() {
       console.warn(`  ⚠️ Skipping route ${route}: HTTP ${ssrRes?.status ?? 'ERR'}`);
       continue;
     }
-    let ssrHtml = await ssrRes.text();
+    const rawBytes = Buffer.from(await ssrRes.arrayBuffer());
+    const rawSha256 = sha256(rawBytes);
+    const rawDocument = 'forensics/raw-documents/' + rawSha256 + '.html';
+    fs.mkdirSync(path.dirname(path.join(OUT_DIR, rawDocument)), {recursive:true});
+    fs.writeFileSync(path.join(OUT_DIR, rawDocument), rawBytes);
+    let ssrHtml = rawBytes.toString('utf8');
 
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -686,6 +732,7 @@ async function run() {
     stackClassification[route] = fingerprint;
     routeMetadata.push({
       route,
+      rawDocument, rawSha256,
       title: fingerprint.title,
       mode: fingerprint.mode,
       stylesheets: fingerprint.stylesheets
@@ -754,7 +801,7 @@ async function run() {
 
     for (const m of ssrHtml.matchAll(/(?:data-[a-z0-9-]+|src|poster)=["']([^"']+)["']/gi)) {
       const fullAttr = m[0];
-      const val = m[1].trim().replace(/&amp;/g, '&');
+      const val = m[1].trim();
       if (!val) continue;
       if (
         (fullAttr.includes('basepath') || fullAttr.includes('media-base') || fullAttr.includes('holiday-vat')) &&
@@ -769,7 +816,7 @@ async function run() {
       }
     }
     for (const m of ssrHtml.matchAll(/srcset=["']([^"']+)["']/gi)) {
-      const parts = m[1].split(',').map((p) => p.trim().split(/\s+/)[0]?.replace(/&amp;/g, '&'));
+      const parts = m[1].split(',').map((p) => p.trim().split(/\s+/)[0]);
       for (const p of parts) {
         if (p && (p.startsWith('/') || p.startsWith('http'))) allUrls.add(p);
       }
@@ -794,21 +841,18 @@ async function run() {
       let pre = ssrHtml.slice(0, flightMarker);
       const post = ssrHtml.slice(flightMarker);
       for (const origin of externalHostsToRewrite) {
-        const host = new URL(origin).hostname;
+        const host = new URL(origin).host;
         pre = pre.split(origin + '/').join(`/__external/${host}/`);
       }
       ssrHtml = pre + post;
     } else {
       for (const origin of externalHostsToRewrite) {
-        const host = new URL(origin).hostname;
+        const host = new URL(origin).host;
         ssrHtml = ssrHtml.split(origin + '/').join(`/__external/${host}/`);
       }
     }
 
     ssrHtml = ssrHtml.replace(/<!--\s*<link[^>]*rel=["']stylesheet["'][^>]*>\s*-->/gi, '');
-    if (!ssrHtml.includes('<base ') && ssrHtml.includes('<head>')) {
-      ssrHtml = ssrHtml.replace('<head>', '<head><base href="/" />');
-    }
     ssrHtml = ssrHtml.replace(
       /<script[^>]*src="https:\/\/consent\.cookiebot\.com\/[^"]*"[^>]*><\/script>/gi,
       '<script>window.Cookiebot={consent:{necessary:true,preferences:true,statistics:true,marketing:true},hasResponse:true,declined:false,runScripts:()=>{}};</script>'
@@ -819,23 +863,27 @@ async function run() {
       ''
     );
 
-    const routeRelDir = route.replace(/^\/+/, '').replace(/\/+$/, '');
+    const routeRelDir = getLocalPathForUrl(fullUrl) === 'index.html' ? '' : getLocalPathForUrl(fullUrl);
+    if (routeRelDir === null) throw new Error('Invalid captured route ' + route);
     const htmlFilePath = routeRelDir ? path.join(OUT_DIR, routeRelDir, 'index.html') : path.join(OUT_DIR, 'index.html');
     fs.mkdirSync(path.dirname(htmlFilePath), { recursive: true });
     fs.writeFileSync(htmlFilePath, ssrHtml, 'utf8');
-    console.log(`  💾 Preserved Virgin SSR HTML -> ${path.relative(OUT_DIR, htmlFilePath)} (${ssrHtml.length} bytes)`);
+    routeMetadata.at(-1).documentFile = path.relative(OUT_DIR, htmlFilePath);
+    console.log(`  💾 Saved replay HTML -> ${path.relative(OUT_DIR, htmlFilePath)} (${ssrHtml.length} bytes)`);
 
     for (const vp of viewports) {
       await page.setViewportSize({ width: vp.width, height: vp.height });
       await page.waitForTimeout(350);
 
-      const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
-      for (let y = 0; y <= scrollHeight; y += 250) {
-        await page.evaluate((top) => window.scrollTo(0, top), y);
-        await page.waitForTimeout(60);
+      const maxScrollY = await page.evaluate(() => Math.max(0, document.documentElement.scrollHeight - window.innerHeight));
+      if (maxScrollY > 0) {
+        for (let y = 250; y < maxScrollY + 250; y += 250) {
+          await page.evaluate((top) => window.scrollTo(0, top), Math.min(y, maxScrollY));
+          await page.waitForTimeout(60);
+        }
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(200);
       }
-      await page.evaluate(() => window.scrollTo(0, 0));
-      await page.waitForTimeout(200);
 
       await page.evaluate(() => {
         const interactives = document.querySelectorAll(
@@ -847,24 +895,6 @@ async function run() {
         }
       });
       await page.waitForTimeout(300);
-
-      const domMediaUrls = await page.evaluate(() => {
-        const urls = [];
-        for (const el of document.querySelectorAll('img, source, video')) {
-          const s = el.getAttribute('src');
-          if (s) urls.push(s);
-          if (el instanceof HTMLImageElement && el.currentSrc) urls.push(el.currentSrc);
-          const ss = el.getAttribute('srcset');
-          if (ss) {
-            for (const part of ss.split(',')) {
-              const u = part.trim().split(/\s+/)[0];
-              if (u) urls.push(u);
-            }
-          }
-        }
-        return urls;
-      }).catch(() => []);
-      for (const du of domMediaUrls) allUrls.add(du);
     }
 
     for (const rawUrl of allUrls) {
@@ -900,7 +930,7 @@ async function run() {
       }
     }
 
-    if (discoverRoutes && discoveredRoutes.size < maxRoutes) {
+    if (discoverRoutes) {
       const foundLinks = await page.evaluate((tgtHost) => {
         const links = [];
         for (const a of document.querySelectorAll('a[href]')) {
@@ -910,10 +940,10 @@ async function run() {
             if (
               normHost === tgtHost &&
               !u.pathname.match(/\.(pdf|zip|png|jpg|jpeg|svg|webp|mp4|xml|txt|json)$/i) &&
-              u.pathname !== '/'
+              (u.pathname !== '/' || u.search)
             ) {
               const cleanRoute = u.pathname.replace(/\/+$/, '') || '/';
-              links.push(cleanRoute);
+              links.push(cleanRoute + u.search);
             }
           } catch { }
         }
@@ -921,13 +951,12 @@ async function run() {
       }, targetHost);
 
       for (const link of foundLinks) {
-        if (discoveredRoutes.size < maxRoutes) {
-          discoveredRoutes.add(link);
-        }
+        discoveredRoutes.add(link);
       }
     }
   }
 
+  while (pendingResponses.size) await Promise.all([...pendingResponses]);
   await browser.close();
 
   await harvestDynamicBundlerChunks();
@@ -958,9 +987,11 @@ async function run() {
           await downloadFullAsset(resolvedUrl.href);
         }
         if (rawRef.startsWith('.') || resolvedUrl.hostname.replace(/^www\./, '') !== targetHost) {
-          const localRel = getLocalPathForUrl(resolvedUrl.href);
+          const fragment = resolvedUrl.hash;
+          resolvedUrl.hash = '';
+          const localRel = savedAssets.get(resolvedUrl.href)?.relPath ?? getLocalPathForUrl(resolvedUrl.href);
           if (localRel) {
-            cssContent = cssContent.replace(fullMatch, `url(${quote}/${localRel.replace(/\\/g, '/')}${quote})`);
+            cssContent = cssContent.replace(fullMatch, `url(${quote}/${localRel.replace(/\\/g, '/')}${fragment}${quote})`);
             modified = true;
           }
         }
@@ -970,67 +1001,6 @@ async function run() {
     if (modified) {
       fs.writeFileSync(cssFilePath, cssContent, 'utf8');
     }
-  }
-
-  // Localize mirrored external origins inside downloaded JS bundles & external subframe HTMLs
-  const externalDir = path.join(OUT_DIR, '__external');
-  if (fs.existsSync(externalDir)) {
-    const mirroredHosts = fs
-      .readdirSync(externalDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
-
-    const localizeTree = (dir) => {
-      if (!fs.existsSync(dir)) return;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (['node_modules', '__sourcemaps__', 'forensics', '__api_fixtures__'].includes(entry.name)) continue;
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) localizeTree(full);
-        else if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.mjs'))) {
-          const orig = fs.readFileSync(full, 'utf8');
-          let next = orig;
-          for (const host of mirroredHosts) {
-            const esc = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            // Rewrite inside quoted string literals only (never corrupt /.../ regex literals!)
-            next = next.replace(
-              new RegExp(`(["'\`])https?:\\/\\/${esc}(?=\\/|\\1)`, 'g'),
-              `$1/__external/${host}`
-            );
-          }
-          // Stripe air-gap origin neutralizer (when js.stripe.com is mirrored)
-          if (mirroredHosts.includes('js.stripe.com')) {
-            next = next.replace(
-              /\/\^https:\\\/\\\/js\\\.stripe\\\.com\\\/v3\\\/\?\(\\\?\.\*\)\?\$\//g,
-              '/^(?:https:\\/\\/js\\.stripe\\.com|\\/__external\\/js\\.stripe\\.com)\\/[^\\s]*$/'
-            );
-            next = next.replace(
-              /key:"_ensureStripeHosted",value:function\(e\)\{if\(!e\)throw[^}]+\}/g,
-              'key:"_ensureStripeHosted",value:function(){}'
-            );
-          }
-          if (next !== orig) {
-            try {
-              new Function(next);
-              fs.writeFileSync(full, next, 'utf8');
-            } catch (syntaxErr) {
-              if (/import statement|Unexpected token ['"]?export/i.test(syntaxErr.message)) {
-                fs.writeFileSync(full, next, 'utf8');
-              } else {
-                console.warn(`  ⚠️ Skipped localized JS rewrite due to syntax guard: ${path.relative(OUT_DIR, full)} (${syntaxErr.message})`);
-              }
-            }
-          }
-        } else if (entry.isFile() && entry.name.endsWith('.html') && full.includes(`${path.sep}__external${path.sep}`)) {
-          let htmlText = fs.readFileSync(full, 'utf8');
-          for (const host of mirroredHosts) {
-            htmlText = htmlText.split(`https://${host}/`).join(`/__external/${host}/`);
-          }
-          fs.writeFileSync(full, htmlText, 'utf8');
-        }
-      }
-    };
-    localizeTree(OUT_DIR);
-    console.log(`  🔒 Localized ${mirroredHosts.length} external host(s) across captured JS & subframe HTMLs: ${mirroredHosts.join(', ')}`);
   }
 
   const finalRoutesList = routeMetadata.map((r) => r.route);
@@ -1043,9 +1013,11 @@ async function run() {
     routesManifestPath,
     JSON.stringify(
       {
+        captureVersion: 2,
         targetOrigin,
         capturedAt: new Date().toISOString(),
         totalRoutes: routeMetadata.length,
+        excludedOrFailed: [...discoveredRoutes].filter(route => !finalRoutesList.includes(route)),
         routes: routeMetadata
       },
       null,
@@ -1054,6 +1026,9 @@ async function run() {
     'utf8'
   );
 
+  const forensicOutput = (file, data) => fs.writeFileSync(path.join(OUT_DIR, 'forensics', file), JSON.stringify(data, null, 2));
+  forensicOutput('source-maps.json', {version: 1, maps: [...sourceMaps.values()], failures: [...mapFailures.values()].filter(item => !sourceMaps.has(item.scriptUrl))});
+  forensicOutput('assets.json', {version: 1, targetOrigin, assets: [...savedAssets].map(([url, data]) => ({url, ...data}))});
   const fixtureIndexPath = path.join(OUT_DIR, '__api_fixtures__', 'manifest.json');
   fs.writeFileSync(fixtureIndexPath, JSON.stringify(apiFixtures, null, 2), 'utf8');
 
@@ -1104,6 +1079,9 @@ async function run() {
     });
   }
 
+  if (!finalRoutesList.length || finalRoutesList.length !== discoveredRoutes.size) {
+    throw new Error('Capture incomplete. See forensics/routes-manifest.json for excluded or failed routes.');
+  }
   console.log(`\n🎉 Stage 0 Mirror + Deep Chrome CDP Forensics complete!`);
   console.log(`  Captured Routes:    ${finalRoutesList.join(', ')}`);
   console.log(`  Total Assets Saved: ${savedAssets.size}`);

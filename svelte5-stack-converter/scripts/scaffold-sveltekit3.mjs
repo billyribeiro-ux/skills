@@ -63,18 +63,18 @@ const pkgJson = {
     preview: `vite preview --port ${PORT}`,
     check: 'svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings',
     'check:watch': 'svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch',
-    'audit:svelte': 'node ../.agent/skills/svelte5-stack-converter/scripts/audit-svelte5-mcp.mjs --app .'
+    'audit:svelte': 'node scripts/audit-svelte5-mcp.mjs --app .'
   },
   devDependencies: {
-    '@sveltejs/adapter-auto': '^8.0.1',
-    '@sveltejs/kit': '^3.2.0',
-    '@sveltejs/mcp': '^0.1.30',
-    '@sveltejs/vite-plugin-svelte': '^7.3.1',
-    '@types/node': '^26.6.6',
-    svelte: '^5.57.3',
-    'svelte-check': '^4.7.8',
-    typescript: '~6.0.3',
-    vite: '^8.3.8'
+    '@sveltejs/adapter-auto': '8.0.1',
+    '@sveltejs/kit': '3.2.1',
+    '@sveltejs/mcp': '0.1.31',
+    '@sveltejs/vite-plugin-svelte': '7.3.1',
+    '@types/node': '26.6.6',
+    svelte: '5.57.3',
+    'svelte-check': '4.7.8',
+    typescript: '6.0.3',
+    vite: '8.3.8'
   }
 };
 
@@ -95,6 +95,8 @@ if (fs.existsSync(stage1PkgPath)) {
   } catch { }
 }
 
+fs.mkdirSync(path.join(TARGET_DIR, 'scripts'), { recursive: true });
+fs.copyFileSync(new URL('./audit-svelte5-mcp.mjs', import.meta.url), path.join(TARGET_DIR,'scripts','audit-svelte5-mcp.mjs'));
 fs.writeFileSync(path.join(TARGET_DIR, 'package.json'), JSON.stringify(pkgJson, null, 2), 'utf8');
 
 // Canonical SvelteKit 3 vite.config.ts (strictPort: true prevents silent port drift!)
@@ -130,14 +132,12 @@ const tsconfig = `{
 fs.writeFileSync(path.join(TARGET_DIR, 'tsconfig.json'), tsconfig, 'utf8');
 
 const appHtml = `<!doctype html>
-<html lang="en">
+<html data-site-document>
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <link rel="icon" href="/favicon.ico" />
     %sveltekit.head%
   </head>
-  <body data-sveltekit-preload-data="hover">
+  <body data-site-body data-sveltekit-reload>
     <div style="display: contents">%sveltekit.body%</div>
   </body>
 </html>
@@ -273,6 +273,18 @@ export function animateMotion(options: MotionOptions): Attachment<HTMLElement> {
       });
     }
 
+    if (options.whileTap) {
+      const press = () => runTarget(options.whileTap);
+      const release = () => runTarget(options.animate ?? { opacity: 1, x: 0, y: 0, scale: 1 });
+      element.addEventListener('pointerdown', press);
+      window.addEventListener('pointerup', release);
+      window.addEventListener('pointercancel', release);
+      cleanups.push(() => {
+        element.removeEventListener('pointerdown', press);
+        window.removeEventListener('pointerup', release);
+        window.removeEventListener('pointercancel', release);
+      });
+    }
     return () => {
       observer?.disconnect();
       for (const off of cleanups) off();
@@ -283,8 +295,12 @@ export function animateMotion(options: MotionOptions): Attachment<HTMLElement> {
 fs.writeFileSync(path.join(TARGET_DIR, 'src', 'lib', 'motion', 'motionAttachment.ts'), motionAttachmentTs, 'utf8');
 
 // Canonical src/hooks.server.ts (API Fixtures + HLS .m3u8/.ts + HTTP 206 Byte-Range Streaming + Decoded Static Paths)
-const hooksServer = `import type { Handle } from '@sveltejs/kit/hooks';
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+fs.writeFileSync(path.join(TARGET_DIR, 'src', 'lib', 'data', 'document-shells.json'), '{}');
+fs.writeFileSync(path.join(TARGET_DIR, 'src', 'lib', 'data', 'resource-index.json'), '{}');
+const hooksServer = `import resources from '#lib/data/resource-index.json';
+import shells from '#lib/data/document-shells.json';
+import type { Handle } from '@sveltejs/kit/hooks';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join, extname } from 'node:path';
 
 const MIME_MAP: Record<string, string> = {
@@ -316,40 +332,15 @@ const MIME_MAP: Record<string, string> = {
 
 const STREAMABLE_EXTS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.ts', '.m4s', '.mp3', '.wav', '.ogg', '.wasm', '.glb']);
 
-function findApiFixture(fixtureDir: string, pathname: string, search: string): string | null {
-  if (!existsSync(fixtureDir)) return null;
-  const safeBase = pathname.replace(/^\\/+/, '').replace(/\\//g, '__') || 'root';
-  const searchHash = search ? Buffer.from(search).toString('hex').slice(0, 16) : '';
-  const directCandidates = [
-    join(fixtureDir, \`\${safeBase}\${searchHash ? '__' + searchHash : ''}.json\`),
-    join(fixtureDir, \`\${safeBase}.json\`)
-  ];
-  for (const cf of directCandidates) {
-    if (existsSync(cf) && statSync(cf).isFile()) return cf;
-  }
-  const prefix = \`\${safeBase}__\`;
-  const files = readdirSync(fixtureDir);
-  const match = files.find((f) => f.startsWith(prefix) && f.endsWith('.json'));
-  return match ? join(fixtureDir, match) : null;
-}
-
 export const handle: Handle = async ({ event, resolve }) => {
   const pathname = decodeURIComponent(event.url.pathname);
-  const cleanPath = pathname.replace(/^\\/+/, '');
-
-  // 1. Serve first-party JSON API fixtures
-  const fixtureDir = join(process.cwd(), 'static', '__api_fixtures__');
-  const matchedFixture = findApiFixture(fixtureDir, pathname, event.url.search);
-  if (matchedFixture) {
-    const body = readFileSync(matchedFixture);
-    return new Response(body, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
+  if (pathname.split('/').some(segment => segment === '..') || pathname.includes('\\\\')) return new Response(null, { status: 400 });
+  const requestUrl = new URL(event.request.url);
+  const isRsc = requestUrl.searchParams.has('_rsc') || event.request.headers.get('rsc') === '1';
+  const key = (isRsc ? 'rsc:' : '') + requestUrl.pathname + requestUrl.search;
+  const representation = ['GET', 'HEAD'].includes(event.request.method)
+    ? (resources as Record<string, {file: string; contentType: string}>)[key] : undefined;
+  const cleanPath = representation?.file ?? pathname.replace(/^\\/+/, '');
 
   // 2. Serve extensionless CSS endpoints (e.g. /wss/fonts -> static/wss/fonts/index.css)
   const indexCssCandidate = join(process.cwd(), 'static', cleanPath, 'index.css');
@@ -396,18 +387,18 @@ export const handle: Handle = async ({ event, resolve }) => {
           'Content-Range': \`bytes \${start}-\${end}/\${stat.size}\`,
           'Accept-Ranges': 'bytes',
           'Content-Length': String(chunkSize),
-          'Content-Type': MIME_MAP[ext] || 'application/octet-stream',
+          'Content-Type': representation?.contentType || MIME_MAP[ext] || 'application/octet-stream',
           'Access-Control-Allow-Origin': '*'
         }
       });
     }
 
-    if (event.url.pathname !== pathname || ext === '.m3u8' || ext === '.ts') {
-      const body = readFileSync(staticFile);
+    if (representation || event.url.pathname !== pathname || ext === '.m3u8' || ext === '.ts') {
+      const body = event.request.method === 'HEAD' ? null : readFileSync(staticFile);
       return new Response(body, {
         status: 200,
         headers: {
-          'Content-Type': MIME_MAP[ext] || 'application/octet-stream',
+          'Content-Type': representation?.contentType || MIME_MAP[ext] || 'application/octet-stream',
           'Accept-Ranges': 'bytes',
           'Access-Control-Allow-Origin': '*'
         }
@@ -415,7 +406,10 @@ export const handle: Handle = async ({ event, resolve }) => {
     }
   }
 
-  const response = await resolve(event);
+  const shell = (shells as Record<string, { html: string; body: string }>)[event.url.pathname.replace(/\\/$/, '') || '/'];
+  const response = await resolve(event, { transformPageChunk: ({ html }) =>
+    html.replace('<html data-site-document>', () => '<html' + (shell?.html ?? ' lang="en"') + '>')
+        .replace('<body data-site-body data-sveltekit-reload>', () => '<body data-sveltekit-reload' + (shell?.body ?? '') + '>') });
   response.headers.set('Permissions-Policy', 'unload=*');
   if (response.headers.get('content-type')?.includes('text/html')) {
     response.headers.set('Cache-Control', 'no-store');
@@ -425,31 +419,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 `;
 fs.writeFileSync(path.join(TARGET_DIR, 'src', 'hooks.server.ts'), hooksServer, 'utf8');
 
-function detectHydrationConflict(sourceDir) {
-  let hasConflict = false;
-  function walk(d) {
-    if (!fs.existsSync(d) || hasConflict) return;
-    for (const f of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, f.name);
-      if (f.isDirectory() && f.name !== 'node_modules') walk(p);
-      else if (f.isFile() && (f.name.endsWith('.js') || f.name.endsWith('.json'))) {
-        const content = fs.readFileSync(p, 'utf8');
-        if (content.includes('SplitText') || content.includes('webflow.js') || content.includes('Typed.js')) {
-          hasConflict = true;
-          break;
-        }
-      }
-    }
-  }
-  walk(sourceDir);
-  return hasConflict;
-}
-
-const hasHydrationConflict = detectHydrationConflict(SOURCE_DIR);
-
-const layoutServerTs = `export const prerender = true;
+const layoutServerTs = `export const prerender = false;
 export const ssr = true;
-export const csr = ${!hasHydrationConflict};
+export const csr = true;
 `;
 fs.writeFileSync(path.join(TARGET_DIR, 'src', 'routes', '+layout.server.ts'), layoutServerTs, 'utf8');
 
@@ -511,7 +483,7 @@ function copyVerifiedStaticAssets(src, dest, relFromRoot = '') {
   if (!fs.existsSync(src)) return;
   const stat = fs.statSync(src);
   if (stat.isDirectory()) {
-    if (['node_modules', '.git', 'forensics', 'src', '__sourcemaps__'].includes(path.basename(src))) return;
+    if (['node_modules', '.git', 'forensics', 'src', 'recovered-source', '.native-tools', '.native-build', '__sourcemaps__'].includes(path.basename(src))) return;
     fs.mkdirSync(dest, { recursive: true });
     for (const file of fs.readdirSync(src)) {
       const nextRel = relFromRoot ? `${relFromRoot}/${file}` : file;

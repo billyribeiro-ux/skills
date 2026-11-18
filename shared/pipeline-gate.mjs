@@ -2,15 +2,19 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const DEFAULT_SKIP_DIRS = new Set([
-  'node_modules',
-  '.git',
-  '.svelte-kit',
-  'build',
-  '__sourcemaps__',
-  'parity-reports',
-  'parity'
-]);
+// Scope exclusions to workflow-owned locations: a public /build asset is valid capture evidence.
+const excludedPaths = new Set(['.git','node_modules','forensics/parity-reports','forensics/parity']);
+
+function fileDigest(file, size, buffer) {
+  const hash = crypto.createHash('sha256');
+  if (size <= buffer.length) return hash.update(fs.readFileSync(file)).digest('hex');
+  const fd = fs.openSync(file,'r');
+  try {
+    let bytes;
+    while ((bytes = fs.readSync(fd,buffer,0,buffer.length,null)) > 0) hash.update(buffer.subarray(0,bytes));
+  } finally { fs.closeSync(fd); }
+  return hash.digest('hex');
+}
 
 /**
  * Computes a deterministic SHA-256 tree digest for a pipeline stage directory,
@@ -22,23 +26,30 @@ export function computeStageDigest(stage, rootDir) {
 
   const certName = `stage${stage}-cert.json`;
   const entries = [];
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
 
   function walk(dir) {
     const dirItems = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     for (const item of dirItems) {
-      if (DEFAULT_SKIP_DIRS.has(item.name)) continue;
       if (item.name === '.DS_Store') continue;
       const full = path.join(dir, item.name);
       const rel = path.relative(absRoot, full).replace(/\\/g, '/');
 
-      if (item.isDirectory()) {
+      if (excludedPaths.has(rel) || (stage === 2 && ['.svelte-kit','build'].includes(rel))) continue;
+      if (item.isSymbolicLink()) {
+        const resolved = fs.realpathSync(full);
+        const base = fs.realpathSync(absRoot);
+        if (!resolved.startsWith(base + path.sep)) throw new Error('Untracked external stage link: '+rel);
+        const target = fs.readlinkSync(full);
+        entries.push({rel, size:Buffer.byteLength(target), sha256:crypto.createHash('sha256').update('link\0'+target).digest('hex')});
+      } else if (item.isDirectory()) {
         walk(full);
       } else if (item.isFile()) {
         if (rel === `forensics/${certName}`) continue;
         // Stage 2 excludes conversion-batches scratch metadata that doesn't affect runtime parity
-        if (stage === 2 && (rel === 'conversion-batches.json' || rel === 'pnpm-lock.yaml')) continue;
+        if (stage === 2 && rel === 'conversion-batches.json') continue;
         const stat = fs.statSync(full);
-        const fileHash = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+        const fileHash = fileDigest(full,stat.size,buffer);
         entries.push({ rel, size: stat.size, sha256: fileHash });
       }
     }
@@ -54,6 +65,25 @@ export function computeStageDigest(stage, rootDir) {
     digest: treeHasher.digest('hex'),
     fileCount: entries.length
   };
+}
+
+export function manifestRoutes(dir) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'forensics', 'routes-manifest.json'), 'utf8'));
+  if (!Array.isArray(manifest.routes) || !manifest.routes.length || manifest.excludedOrFailed?.length) {
+    throw new Error('Missing or incomplete route coverage in ' + dir);
+  }
+  const routes = manifest.routes.map(entry => typeof entry === 'string' ? entry : entry?.route);
+  if (routes.some(route => typeof route !== 'string' || !route.startsWith('/') || route.startsWith('//')) || new Set(routes).size !== routes.length) {
+    throw new Error('Invalid or duplicate route in ' + dir);
+  }
+  return routes;
+}
+
+function assertRouteSet(dir, checkedRoutes) {
+  const expected = manifestRoutes(dir);
+  if (!Array.isArray(checkedRoutes) || expected.length !== checkedRoutes.length || !expected.every(route => checkedRoutes.includes(route))) {
+    throw new Error('Verified routes differ from route manifest in ' + dir);
+  }
 }
 
 export function getCertPath(stage, dir) {
@@ -74,6 +104,7 @@ export function invalidateStageCert(stage, dir) {
  */
 export function mintStageCert({ stage, dir, routes, summary = {} }) {
   const absDir = path.resolve(dir);
+  assertRouteSet(absDir, routes);
   const certPath = getCertPath(stage, absDir);
   fs.mkdirSync(path.dirname(certPath), { recursive: true });
 
@@ -140,20 +171,7 @@ export function assertStageCertified({ requiredStage, dir, callerName = 'Pipelin
     process.exit(1);
   }
 
-  // Verify 100% captured route coverage against routes-manifest.json when present
-  const manifestPath = path.join(absDir, 'forensics', 'routes-manifest.json');
-  if (fs.existsSync(manifestPath)) {
-    try {
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      const manifestRoutes = (manifest.routes || []).map((r) => (typeof r === 'string' ? r : r.route));
-      const missingRoutes = manifestRoutes.filter((r) => !(cert.routes || []).includes(r));
-      if (missingRoutes.length > 0) {
-        console.error(`\n🚫 [PIPELINE LOCK — PARTIAL ROUTE COVERAGE] Stage ${requiredStage} cert omitted routes: ${missingRoutes.join(', ')}`);
-        console.error(`   Full 100%-route verification is mandatory. Re-run:\n   ${remediationCmds[requiredStage]}`);
-        process.exit(1);
-      }
-    } catch {}
-  }
+  assertRouteSet(absDir, cert.routes);
 
   const currentTree = computeStageDigest(requiredStage, absDir);
   if (!currentTree || currentTree.digest !== cert.digest) {

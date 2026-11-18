@@ -416,7 +416,7 @@ export async function humanizeJavaScript(sourceCode, options = {}) {
       unminify: true
     });
     code = cracked.code;
-  } catch { }
+  } catch {}
 
   let ast;
   try {
@@ -867,33 +867,8 @@ export function sanitizeAndFormatCss(rawCss) {
     for (const a of declsToAdd) rule.append(a);
   });
 
-  // Recursively format multi-line CSS while strictly preserving trailing semicolons on statement @rules
-  const formatCssNodes = (nodes, indent = '') => {
-    const out = [];
-    for (const node of nodes || []) {
-      if (node.type === 'comment') continue;
-      if (node.type === 'decl') {
-        out.push(`${indent}${node.prop}: ${node.value}${node.important ? ' !important' : ''};`);
-      } else if (node.type === 'rule') {
-        const inner = formatCssNodes(node.nodes, `${indent}  `);
-        out.push(`${indent}${node.selector} {\n${inner.join('\n')}\n${indent}}`);
-      } else if (node.type === 'atrule') {
-        if (!node.nodes) {
-          const stmt = `${indent}@${node.name}${node.params ? ` ${node.params}` : ''}`;
-          out.push(stmt.endsWith(';') ? stmt : `${stmt};`);
-        } else {
-          const inner = formatCssNodes(node.nodes, `${indent}  `);
-          out.push(`${indent}@${node.name}${node.params ? ` ${node.params}` : ''} {\n${inner.join('\n')}\n${indent}}`);
-        }
-      } else {
-        out.push(`${indent}${node.toString()}`);
-      }
-    }
-    return out;
-  };
-
-  const formattedRules = formatCssNodes(root.nodes, '');
-  const outCss = formattedRules.join('\n\n') + '\n';
+  // Format multi-line cleanly while strictly preserving trailing semicolons on statement @rules (e.g. @layer a, b;)
+  const outCss = root.toString();
   // Roundtrip assertion: verify sanitized CSS parses cleanly with zero syntax errors
   try {
     postcss.parse(outCss);

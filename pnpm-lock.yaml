@@ -20,6 +20,9 @@ importers:
       '@babel/types':
         specifier: ^7.26.7
         version: 7.29.11
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       pixelmatch:
         specifier: ^7.1.0
         version: 7.2.0

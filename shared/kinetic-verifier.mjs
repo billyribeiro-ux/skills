@@ -118,8 +118,15 @@ export async function auditKineticAndLivingSurface({
     : (webglShaders?.canvasContexts || []).filter((c) => c.route === route).length;
 
   // 1. Zero Dead Canvases Check + RAF Liveness
-  const rafBefore = await page.evaluate(() => window.__AGY_KINETIC__?.rafTicks ?? 0);
-  await page.waitForTimeout(180);
+  const counters = () => {
+    const t = window.__AGY_KINETIC__;
+    if (!t) return null;
+    return { raf: t.rafTicks, draws: Array.from(document.querySelectorAll('canvas'), c => t.drawCalls.get(c) || 0) };
+  };
+  const [rafBefore, baseBefore] = await Promise.all([page.evaluate(counters), mirrorPage?.evaluate(counters)]);
+  if (!rafBefore) throw Error('Kinetic observer was not installed before navigation');
+  await page.waitForTimeout(250);
+  const baseAfter = await mirrorPage?.evaluate(counters);
   const canvasReport = await page.evaluate((rafStart) => {
     const tracker = window.__AGY_KINETIC__;
     const rafAfter = tracker?.rafTicks ?? 0;
@@ -169,6 +176,7 @@ export async function auditKineticAndLivingSurface({
         inViewport,
         ctxType,
         drawCalls,
+        drawsDuringSample: drawCalls - (rafStart.draws[i] ?? 0),
         has2dPixels
       });
     }
@@ -176,7 +184,7 @@ export async function auditKineticAndLivingSurface({
     return {
       totalDomCanvases: canvases.length,
       visibleCanvases,
-      rafDelta: rafAfter - rafStart
+      rafDelta: rafAfter - rafStart.raf
     };
   }, rafBefore);
 
@@ -202,10 +210,15 @@ export async function auditKineticAndLivingSurface({
       );
       continue;
     }
-    if (cv.ctxType === '2d' && cv.has2dPixels === false) {
-      warnings.push(
+    if (cv.inViewport && cv.ctxType === '2d' && cv.has2dPixels === false) {
+      failures.push(
         `Canvas2D #${cv.index} (${cv.id || cv.className || 'anonymous'}) initialized "2d" context but had zero non-transparent pixels at y=0 (may be scrolled off-screen).`
       );
+    }
+    if (cv.inViewport && baseAfter && baseBefore &&
+        baseAfter.draws[cv.index] > baseBefore.draws[cv.index] && cv.drawsDuringSample === 0) {
+      failures.push(`Canvas #${cv.index} stopped drawing while the corresponding mirror canvas advanced.`);
+      continue;
     }
     summary.activeCanvases++;
   }
@@ -243,7 +256,7 @@ export async function auditKineticAndLivingSurface({
     const revealAudit = await page.evaluate((targets) => {
       const stuck = [];
       let checked = 0;
-      for (const item of targets.slice(0, 30)) {
+      for (const item of targets) {
         if (!item.selector && !item.textSnippet) continue;
         let el = null;
         if (item.selector) {
@@ -255,7 +268,7 @@ export async function auditKineticAndLivingSurface({
               : candidates[0];
           } catch {}
         }
-        if (!el) continue;
+        if (!el) { stuck.push({selector:item.selector, text:item.textSnippet, expectedOpacity:item.finalOpacity, actualOpacity:'missing'}); continue; }
         checked++;
         const cs = window.getComputedStyle(el);
         const op = parseFloat(cs.opacity);
@@ -325,11 +338,11 @@ export async function auditKineticAndLivingSurface({
     }
 
     // 4c. Stage 0 Captured State Transitions
-    for (const st of (recordedStates || []).slice(0, 6)) {
+    for (const st of (recordedStates || [])) {
       if (!st.selector || st.action !== 'click') continue;
       try {
         const target = document.querySelector(st.selector);
-        if (!target) continue;
+        if (!target) { controlErrors.push('Missing recorded control ' + st.selector); continue; }
         tested++;
         const beforeText = (document.body.innerText || '').length;
         const beforeAttr = st.changedAttr ? target.getAttribute(st.changedAttr) : null;
@@ -382,7 +395,7 @@ export async function auditKineticAndLivingSurface({
       }
       return empties;
     });
-    if (midCanvasEmpty.length > 0 && warnings.length > 0) {
+    if (midCanvasEmpty.length > 0) {
       failures.push(`In-viewport Canvas2D rendered completely blank during scroll on "${route}": ${midCanvasEmpty.join(', ')}`);
     }
     await page.evaluate(() => window.scrollTo(0, 0));

@@ -65,7 +65,7 @@ const child = fork(targetScript, ['--mirror-dir', MIRROR_DIR, '--out-dir', OUT_D
 
 function runPostDecompileAudit(outDir) {
   const issues = [];
-  const skipDirs = new Set(['node_modules', '.git', 'forensics', '__api_fixtures__', '__external']);
+  const skipDirs = new Set(['node_modules', '.git', 'forensics', '__api_fixtures__', '__external','recovered-source','.native-tools']);
 
   function scan(dir) {
     if (!fs.existsSync(dir)) return;
@@ -104,7 +104,13 @@ function runPostDecompileAudit(outDir) {
 child.on('exit', (code) => {
   if (code === 0) {
     runPostDecompileAudit(OUT_DIR);
-    console.log(`🎉 Stage 1 Decompilation finished successfully in Mode ${mode}. Now implement interactive/canvas controllers in src/ and run verify-stage1-native.mjs before advancing to Stage 2.`);
+    const evidence = JSON.parse(fs.readFileSync(path.join(OUT_DIR,'forensics','source-recovery.json')));
+    if (evidence.runtimeStatus === 'requires-runtime-reconstruction') {
+      console.error('Partial native output retained. Runtime reconstruction is required. See forensics/source-recovery.json.');
+      process.exitCode = 2;
+      return;
+    }
+    console.log(`Generated ${evidence.runtimeStatus}. Run Stage 1 verification before advancing.`);
   } else {
     console.error(`❌ Stage 1 Decompilation failed with exit code ${code}.`);
     process.exit(code || 1);

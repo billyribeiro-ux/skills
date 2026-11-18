@@ -44,14 +44,15 @@ function scanFiles(dir) {
   return list;
 }
 
-const allFiles = scanFiles(srcDir);
+const recoveryFile = path.join(SOURCE_DIR, 'forensics', 'source-recovery.json');
+const recovery = fs.existsSync(recoveryFile) ? JSON.parse(fs.readFileSync(recoveryFile,'utf8')) : null;
+const staticMode = recovery?.mode === 'B' || ['reconstructed-runtime', 'source-built-runtime'].includes(recovery?.runtimeStatus);
+const allFiles = scanFiles(srcDir).filter(file => !staticMode || !/^(?:sections|reconstructed)\//.test(path.relative(srcDir,file)));
 const fileMetadata = [];
 
 for (const f of allFiles) {
   const rel = path.relative(srcDir, f).replace(/\\/g, '/');
   const base = path.basename(f);
-  if (base === 'main.js' || base === 'index.js') continue;
-  const content = fs.readFileSync(f, 'utf8');
 
   let tier = 1;
   let mode = 'Mode A (Component)';
@@ -72,7 +73,7 @@ for (const f of allFiles) {
   } else if (f.endsWith('.jsx') || f.endsWith('.tsx')) {
     tier = 1;
     mode = 'Mode A (Interactive Island / UI)';
-    targetSubpath = `src/lib/components/${base.replace(/\.(jsx?|tsx?)$/, '.svelte')}`;
+    targetSubpath = `src/lib/${rel.replace(/\.(jsx?|tsx?)$/, '.svelte')}`;
   } else {
     tier = 1;
     mode = 'Domain Utility';

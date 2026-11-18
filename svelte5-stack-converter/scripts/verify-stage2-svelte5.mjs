@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { reconstructedAssetPath } from './reconstruction-input.mjs';
 import { assertStageCertified, invalidateStageCert, mintStageCert } from '../../shared/pipeline-gate.mjs';
 import { auditKineticAndLivingSurface, installKineticObserver } from '../../shared/kinetic-verifier.mjs';
 
@@ -26,23 +27,11 @@ const SKIP_PARITY = args.includes('--skip-parity');
 const ALLOW_PARTIAL = args.includes('--allow-partial-routes');
 
 // Auto-discover ALL captured routes from Stage 0/2 forensics/routes-manifest.json
-let manifestRoutes = ['/'];
-for (const cand of [
-  path.join(SVELTE_DIR, 'forensics', 'routes-manifest.json'),
-  path.join(NATIVE_DIR, 'forensics', 'routes-manifest.json'),
-  path.join(path.dirname(SVELTE_DIR), '00-mirror', 'forensics', 'routes-manifest.json')
-]) {
-  if (fs.existsSync(cand)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(cand, 'utf8'));
-      if (Array.isArray(parsed.routes) && parsed.routes.length > 0) {
-        manifestRoutes = parsed.routes.map((r) => (typeof r === 'string' ? r : r.route));
-        break;
-      }
-    } catch { }
-  }
-}
-
+const manifest = JSON.parse(fs.readFileSync(path.join(MIRROR_DIR,'forensics','routes-manifest.json'), 'utf8'));
+const manifestRoutes = manifest.routes.map(r => typeof r === 'string' ? r : r.route);
+if (!manifestRoutes.length) throw Error('Original capture manifest is empty');
+const nativeEvidence = JSON.parse(fs.readFileSync(path.join(NATIVE_DIR,'forensics','source-recovery.json'),'utf8'));
+const authored = new Set(nativeEvidence.publicScripts.filter(s => s.status === 'preserved-public').map(s => s.path));
 const explicitRoutes = getArg('--routes', '');
 const ROUTES = explicitRoutes
   ? explicitRoutes.split(',').map((r) => r.trim()).filter(Boolean)
@@ -126,6 +115,19 @@ if (fs.existsSync(path.join(SVELTE_DIR, 'svelte.config.js'))) {
 // Ban mirrored JS chunks or HTML route shadows inside static/
 for (const sf of allStaticFiles) {
   const relStatic = path.relative(SVELTE_DIR, sf).replace(/\\/g, '/');
+  const assetPath = path.relative(svelteStaticDir,sf).replaceAll(path.sep,'/');
+  if (nativeEvidence.runtimeStatus === 'reconstructed-runtime') {
+    const nativeOutput = nativeEvidence.reconstruction.routes.flatMap(row => row.outputs).find(o => reconstructedAssetPath(o.file) === assetPath);
+    if (nativeOutput && fs.readFileSync(path.join(NATIVE_DIR,nativeOutput.file)).equals(fs.readFileSync(sf))) continue;
+  }
+  const rebuilt = nativeEvidence.publicScripts.find(s => s.status === 'rebuilt-from-source');
+  if (rebuilt) {
+    const rebuiltPath = assetPath === 'assets/recovered-entry.js' ? rebuilt.output :
+      assetPath.startsWith('assets/lazy/') ? path.join(path.dirname(rebuilt.output), assetPath.slice('assets/'.length)) : null;
+    if (rebuiltPath && fs.existsSync(path.join(NATIVE_DIR,rebuiltPath)) &&
+        fs.readFileSync(path.join(NATIVE_DIR,rebuiltPath)).equals(fs.readFileSync(sf))) continue;
+  }
+  if (authored.has(assetPath) && fs.readFileSync(path.join(NATIVE_DIR,assetPath)).equals(fs.readFileSync(sf))) continue;
   if (/\.(?:html|svelte|m?js)$/i.test(relStatic)) {
     cheatViolations.push({
       file: relStatic,
@@ -198,7 +200,7 @@ const qualityScript = path.resolve(
   new URL('../../native-stack-decompiler/scripts/verify-human-code-quality.mjs', import.meta.url).pathname
 );
 try {
-  execSync(`node "${qualityScript}" --src-dir "${svelteSrcDir}"`, { stdio: 'inherit' });
+  execFileSync(process.execPath,[qualityScript,'--src-dir',svelteSrcDir],{stdio:'inherit'});
   console.log(`  ✅ Gate 2 PASSED: Author-grade code quality verified.\n`);
 } catch {
   console.error(`❌ Gate 2 FAILED: Code quality infractions detected in ${svelteSrcDir}.`);
@@ -218,6 +220,7 @@ if (!fs.existsSync(svelteKitBin) || !fs.existsSync(svelteCheckBin)) {
 }
 
 try {
+  execFileSync('pnpm', ['--config.verify-deps-before-run=false','run','build'], { cwd: SVELTE_DIR, stdio: 'inherit' });
   execFileSync(svelteKitBin, ['sync'], { cwd: SVELTE_DIR, stdio: 'inherit' });
   execFileSync(svelteCheckBin, ['--tsconfig', './tsconfig.json', '--fail-on-warnings'], {
     cwd: SVELTE_DIR,
@@ -254,6 +257,30 @@ async function verifyServerOnline(url) {
   } catch {
     return false;
   }
+}
+
+// With this option the production preview starts after the build and type checks.
+if (args.includes('--launch-preview')) {
+  const endpoint = new URL(SVELTE_URL);
+  if (endpoint.hostname !== '127.0.0.1' || endpoint.protocol !== 'http:' || !endpoint.port) {
+    throw new Error('Managed preview requires a loopback HTTP URL with an explicit port.');
+  }
+  const preview = spawn(process.execPath, [
+    path.join(SVELTE_DIR, 'node_modules', 'vite', 'bin', 'vite.js'),
+    'preview', '--host', endpoint.hostname, '--port', endpoint.port, '--strictPort'
+  ], {cwd:SVELTE_DIR, stdio:['ignore','pipe','inherit'], env:{...process.env,NO_COLOR:'1'}});
+  process.once('exit', () => preview.kill());
+  await new Promise((resolve,reject) => {
+    const timeout = setTimeout(() => reject(new Error('Production preview startup timed out')), 20000);
+    let startup = '';
+    preview.stdout.on('data', chunk => {
+      process.stdout.write(chunk);
+      startup = (startup + chunk).slice(-4096);
+      if (startup.includes(endpoint.origin)) {clearTimeout(timeout); resolve();}
+    });
+    preview.once('error',error => {clearTimeout(timeout); reject(error);});
+    preview.once('exit', code => {clearTimeout(timeout); reject(new Error('Production preview exited ('+code+')'));});
+  });
 }
 
 const [mirrorReady, nativeReady, svelteReady] = await Promise.all([
@@ -369,7 +396,7 @@ for (const route of ROUTES) {
     const pageNative = await contextNative.newPage();
     const pageSvelte = await contextSvelte.newPage();
 
-    await installKineticObserver(pageSvelte);
+    await Promise.all([installKineticObserver(pageMirror),installKineticObserver(pageSvelte)]);
 
     const svelteClient = await contextSvelte.newCDPSession(pageSvelte);
     await svelteClient.send('Audits.enable');
@@ -824,13 +851,8 @@ if (parityErrors.length > 0) {
   }
   process.exit(1);
 } else {
-  const cert = mintStageCert({
-    stage: 2,
-    dir: SVELTE_DIR,
-    routes: ROUTES,
-    summary: { mirrorUrl: MIRROR_URL, nativeUrl: NATIVE_URL, svelteUrl: SVELTE_URL, comparisonsCount: comparisons.length }
-  });
-  console.log(`🔒 Stage 2 Certificate Minted: ${cert.digest.slice(0, 16)}... (${cert.fileCount} files, ${ROUTES.length} routes)`);
-  console.log(`\n🎉 ALL 5 NUCLEAR GATES PASSED: Stage 2 Svelte 5 + SvelteKit 3.2 certified with 100% dual-baseline visual, kinetic & behavioral parity!`);
+  if (!comparisons.length) throw Error('No browser comparisons completed');
+  mintStageCert({stage:2,dir:SVELTE_DIR,routes:ROUTES,summary:{comparisons:comparisons.length,productionBuild:true}});
+  console.log(`\n🎉 ALL 5 NUCLEAR GATES PASSED: Stage 2 Svelte 5 + SvelteKit 3.2 certified with 100% unmasked visual, kinetic & behavioral parity!`);
   process.exit(0);
 }

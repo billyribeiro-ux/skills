@@ -53,7 +53,7 @@ async function main() {
       const pageErrors = [];
       targetPage.on('pageerror', (err) => pageErrors.push(err.message));
 
-      await installKineticObserver(targetPage);
+      await Promise.all([installKineticObserver(targetPage),installKineticObserver(mirrorPage)]);
 
       const targetHref = new URL(route, TARGET_URL).href;
       const mirrorHref = new URL(route, MIRROR_URL).href;

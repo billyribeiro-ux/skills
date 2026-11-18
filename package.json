@@ -12,7 +12,8 @@
     "pngjs": "^7.0.0",
     "postcss": "^8.5.1",
     "prettier": "^3.5.0",
-    "webcrack": "^2.16.0"
+    "webcrack": "^2.16.0",
+    "esbuild": "0.28.2"
   },
   "devDependencies": {
     "@types/babel__generator": "^7.6.8",
@@ -23,5 +24,9 @@
     "playwright": "^1.49.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "scripts": {
+    "clone": "node clone.mjs",
+    "test": "node --test --test-concurrency=1 shared/tests/*.test.mjs har-ground-truth-mirror/tests/*.test.mjs native-stack-decompiler/tests/*.test.mjs svelte5-stack-converter/tests/*.test.mjs"
   }
 }

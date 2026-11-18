@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
+const localReplayHelper=new URL('./replay-index.mjs',import.meta.url);
+const {createReplayLookup}=await import(fs.existsSync(localReplayHelper)?localReplayHelper:new URL('../../shared/replay-index.mjs',import.meta.url));
+
 const require = createRequire(import.meta.url);
 let tsCompiler = null;
 try {
@@ -18,6 +21,13 @@ const getArg = (flag, fallback) => {
 
 const DEFAULT_PORT = parseInt(getArg('--port', process.env.PORT || '3011'), 10);
 const ROOT_DIR = path.resolve(getArg('--dir', './01-native'));
+
+const ledgerPath = path.join(ROOT_DIR,'forensics','source-recovery.json');
+const readManifest=rel=>fs.existsSync(path.join(ROOT_DIR,rel))?JSON.parse(fs.readFileSync(path.join(ROOT_DIR,rel))):null;
+const manifest=readManifest('forensics/assets.json');
+const replay=createReplayLookup({assets:manifest,routes:readManifest('forensics/routes-manifest.json'),fixtures:readManifest('__api_fixtures__/manifest.json')||[]});
+const sources = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath)).publicScripts : [];
+const mappedScripts = new Map(sources.filter(s => s.runtimeSource).map(s => [s.path,s.runtimeSource]));
 
 const MIME_MAP = {
   '.html': 'text/html; charset=utf-8',
@@ -90,7 +100,13 @@ function startServer(port) {
     const rawUrl = req.url || '/';
     const parsedUrl = new URL(rawUrl, `http://${req.headers.host || 'localhost'}`);
     const rawPathname = parsedUrl.pathname;
-    const pathname = decodeURIComponent(rawPathname);
+    let pathname;
+    try { pathname = decodeURIComponent(rawPathname); } catch { res.writeHead(400).end(); return; }
+    const parts = pathname.split('/');
+    if (parts.some(part => part === '..' || part.includes('\\') || part.includes('\0')) ||
+        ['forensics','recovered-source','.native-tools'].includes(parts[1])) {
+      res.writeHead(404).end(); return;
+    }
 
     // NUCLEAR GUARD: Stage 1 Server HARD-BLOCKS any request for mirrored bundler JS chunks!
     if (FORBIDDEN_CHUNK_URL.test(pathname)) {
@@ -111,7 +127,7 @@ function startServer(port) {
 
     // API Fixtures (JSON only — RSC streams belong to Stage 0 mirror, never Stage 1)
     const fixtureDir = path.join(ROOT_DIR, '__api_fixtures__');
-    const matchedFixture = findApiFixture(fixtureDir, pathname, parsedUrl.search);
+    const matchedFixture = !manifest && findApiFixture(fixtureDir, pathname, parsedUrl.search);
     if (matchedFixture) {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -141,7 +157,11 @@ function startServer(port) {
       }
     }
 
+    const indexed=replay(parsedUrl.pathname+parsedUrl.search,{method:req.method});
+    const mapped = mappedScripts.get(indexed?.file || targetRelPath);
     const candidates = [
+      ...(mapped ? [path.resolve(ROOT_DIR, mapped)] : []),
+      ...(indexed ? [path.resolve(ROOT_DIR,indexed.file)] : []),
       path.join(ROOT_DIR, targetRelPath === '' ? 'index.html' : targetRelPath),
       path.join(ROOT_DIR, rawRelPath === '' ? 'index.html' : rawRelPath),
       path.join(ROOT_DIR, targetRelPath, 'index.css'),
@@ -151,7 +171,7 @@ function startServer(port) {
       path.join(ROOT_DIR, '__external', rawRelPath)
     ];
 
-    const filePath = candidates.find((f) => fs.existsSync(f) && fs.statSync(f).isFile());
+    const filePath = candidates.find((f) => f.startsWith(ROOT_DIR + path.sep) && fs.existsSync(f) && fs.statSync(f).isFile());
 
     if (!filePath) {
       if (pathname === '/favicon.ico') {
@@ -180,7 +200,8 @@ function startServer(port) {
     const ext = path.extname(filePath).toLowerCase();
 
     // On-the-fly JSX / TSX / TS -> Browser ESM transpilation for Stage 1 /src/ modules
-    if (tsCompiler && ['.jsx', '.tsx', '.ts'].includes(ext)) {
+    const sourceTs = ext === '.ts' && filePath.startsWith(path.join(ROOT_DIR,'src') + path.sep);
+    if (tsCompiler && (sourceTs || ['.jsx','.tsx'].includes(ext))) {
       const sourceText = fs.readFileSync(filePath, 'utf8');
       const transpiled = tsCompiler.transpileModule(sourceText, {
         compilerOptions: {
@@ -200,7 +221,7 @@ function startServer(port) {
       return;
     }
 
-    const contentType = MIME_MAP[ext] || 'application/octet-stream';
+    const contentType = indexed?.contentType || MIME_MAP[ext] || 'application/octet-stream';
 
     const range = req.headers.range;
     if (range && STREAMABLE_EXTS.has(ext)) {
@@ -255,7 +276,7 @@ function startServer(port) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`⚡ Stage 1 Decoded Native Stack Server (Zero-Chunk Enforced) listening on http://localhost:${port}`);
+    console.log(`⚡ Stage 1 Decoded Native Stack Server (Zero-Chunk Enforced) listening on http://127.0.0.1:${server.address().port}`);
     console.log(`📁 Serving Root: ${ROOT_DIR}`);
   });
 

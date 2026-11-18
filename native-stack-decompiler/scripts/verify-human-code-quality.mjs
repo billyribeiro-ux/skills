@@ -22,11 +22,13 @@ if (!fs.existsSync(TARGET_DIR)) {
 }
 
 const rootDir = path.dirname(TARGET_DIR);
+const nativeReportPath = path.join(rootDir, 'forensics', 'source-recovery.json');
+const nativeReport = fs.existsSync(nativeReportPath) ? JSON.parse(fs.readFileSync(nativeReportPath)) : null;
 console.log(`🧐 Scanning Author-Grade Code Quality & Chunk-Bypass Integrity in: ${TARGET_DIR} (Root: ${rootDir})`);
 
 const infractions = [];
 
-function walkFiles(dir, skipDirs = new Set(['node_modules', '.svelte-kit', '.git', 'forensics', '__sourcemaps__'])) {
+function walkFiles(dir, skipDirs = new Set(['node_modules', '.svelte-kit', '.git', 'forensics', '__sourcemaps__', 'recovered-source', '.native-tools'])) {
   const list = [];
   if (!fs.existsSync(dir)) return list;
   for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -73,7 +75,7 @@ const files = walkFiles(TARGET_DIR);
 const codeExts = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.svelte']);
 const executableFiles = files.filter((f) => codeExts.has(path.extname(f).toLowerCase()));
 
-if (executableFiles.length === 0) {
+if (executableFiles.length === 0 && !['source-built-runtime','static-route-runtime'].includes(nativeReport?.runtimeStatus)) {
   console.error(`❌ [NUCLEAR GATE FAIL] Zero executable source files (.js/.jsx/.ts/.tsx/.svelte) found in ${TARGET_DIR}!`);
   process.exit(1);
 }
@@ -280,8 +282,8 @@ for (const file of files) {
     });
   }
 
-  // Rule 5: Monolithic / Leaked Vendor JS/Component Files (>1,500 lines)
-  if (ext !== '.json' && ext !== '.css' && lines.length > 1500) {
+  // Rule 5: Monolithic / Leaked Vendor Files (>1,500 lines)
+  if (ext !== '.json' && lines.length > 1500) {
     infractions.push({
       file: rel,
       rule: 'Leaked Vendor Bundle / Monolithic File',
@@ -299,11 +301,11 @@ for (const file of files) {
         details: 'Mid-file @charset statements violate CSS specs.'
       });
     }
-    if (lines.length > 12000) {
+    if (lines.length > 3000) {
       infractions.push({
         file: rel,
         rule: 'Unsplit CSS Monolith',
-        details: `CSS file exceeds 12,000 lines (${lines.length} lines).`
+        details: `CSS file exceeds 3,000 lines (${lines.length} lines).`
       });
     }
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { requireFreshOutput, finishNative, preservePublicScripts } from './native-recovery.mjs';
 import path from 'node:path';
 import postcss from 'postcss';
 import {
@@ -24,9 +25,8 @@ console.log(`🎬 Stage 1 Mode C Universal Decompiler: Custom JS / Scrollytellin
 console.log(`  Mirror Source: ${MIRROR_DIR}`);
 console.log(`  Output Native: ${OUT_DIR}`);
 
-if (fs.existsSync(OUT_DIR)) {
-  fs.rmSync(OUT_DIR, { recursive: true, force: true });
-}
+requireFreshOutput(MIRROR_DIR, OUT_DIR);
+const publicScripts = [];
 
 fs.mkdirSync(path.join(OUT_DIR, 'src', 'components'), { recursive: true });
 fs.mkdirSync(path.join(OUT_DIR, 'src', 'controllers'), { recursive: true });
@@ -38,7 +38,8 @@ fs.mkdirSync(path.join(OUT_DIR, 'forensics'), { recursive: true });
 // Copy ONLY non-JS assets from mirror so zero .built.js / .min.js / bundler chunks leak into 01-native!
 function copyAssetsWithoutBundles(src, dest) {
   if (!fs.existsSync(src)) return;
-  const stat = fs.statSync(src);
+  const stat = fs.lstatSync(src);
+  if(stat.isSymbolicLink()) return;
   if (stat.isDirectory()) {
     if (['node_modules', '.git', '__sourcemaps__'].includes(path.basename(src))) return;
     fs.mkdirSync(dest, { recursive: true });
@@ -53,6 +54,7 @@ function copyAssetsWithoutBundles(src, dest) {
 }
 
 copyAssetsWithoutBundles(MIRROR_DIR, OUT_DIR);
+publicScripts.push(...preservePublicScripts(MIRROR_DIR, OUT_DIR));
 
 let imageDimensions = {};
 const dimFile = path.join(MIRROR_DIR, 'forensics', 'image-dimensions.json');
@@ -100,47 +102,6 @@ fs.writeFileSync(path.join(OUT_DIR, 'src', 'styles', 'tokens.css'), tokensCss, '
 // 2. Unpack bundler chunks & GLSL shaders universally (zero hardcoded domain files!)
 const unpackSummary = await unpackAllMirrorBundles(MIRROR_DIR, OUT_DIR);
 
-// Also humanize standalone non-webpack/non-turbopack custom engine modules (< 65KB)
-const standaloneImports = [];
-let engineIdx = 1;
-async function unpackStandaloneScripts(dir) {
-  if (!fs.existsSync(dir)) return;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (['node_modules', '__sourcemaps__', 'forensics', '__api_fixtures__'].includes(entry.name)) continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await unpackStandaloneScripts(full);
-    else if (entry.isFile() && entry.name.endsWith('.js')) {
-      const raw = fs.readFileSync(full, 'utf8');
-      if (
-        raw.includes('webpackChunk') ||
-        raw.includes('TURBOPACK') ||
-        raw.length > 65000 ||
-        classifyVendorModule(raw)
-      ) {
-        continue;
-      }
-      const stem = path
-        .basename(entry.name, '.js')
-        .replace(/\.(?:min|built|umd|bundle)$/i, '')
-        .replace(/[^a-zA-Z0-9]+/g, ' ')
-        .trim()
-        .split(/\s+/)
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-        .join('');
-      const modName = stem && !/^\d/.test(stem) ? `${stem}Engine` : `KineticController${engineIdx++}`;
-      const humanized = await humanizeJavaScript(raw, { jsx: false });
-      if (humanized.split('\n').length <= 1400) {
-        const destFile = path.join(OUT_DIR, 'src', 'controllers', `${modName}.js`);
-        if (!fs.existsSync(destFile)) {
-          fs.writeFileSync(destFile, humanized, 'utf8');
-          standaloneImports.push(`./controllers/${modName}.js`);
-        }
-      }
-    }
-  }
-}
-await unpackStandaloneScripts(MIRROR_DIR);
-
 // 3. Forward Stage 0 CDP animation, scroll-scrub, Canvas2D, and shader blueprints into src/animations/
 for (const forensicFile of [
   'animations-blueprint.json',
@@ -161,7 +122,6 @@ const mainEntry = [
   ' * Stage 1 Mode C Universal Kinetic & Media Runtime Entrypoint',
   ' * Zero mirrored .built.js / .min.js chunks — executes strictly decoded ES source modules.',
   ' */',
-  ...standaloneImports.map((imp) => `import '${imp}';`),
   '',
   'export function mountKineticSurface() {',
   '  const rootEl = document.documentElement;',
@@ -180,7 +140,7 @@ const mainEntry = [
   '}',
   ''
 ].join('\n');
-fs.writeFileSync(path.join(OUT_DIR, 'src', 'main.js'), mainEntry, 'utf8');
+if (!fs.existsSync(path.join(OUT_DIR, 'src','main.js'))) fs.writeFileSync(path.join(OUT_DIR, 'src', 'main.js'), mainEntry, 'utf8');
 
 // 5. Clean & format all route HTML files (stripping all .built.js/.min.js script tags)
 async function cleanRouteHtml(dir) {
@@ -191,7 +151,11 @@ async function cleanRouteHtml(dir) {
     if (entry.isDirectory()) await cleanRouteHtml(full);
     else if (entry.isFile() && entry.name.endsWith('.html')) {
       let html = fs.readFileSync(full, 'utf8');
-      html = html.replace(/<script\b[^>]*\bsrc=["'][^"']*["'][^>]*>\s*<\/script>/gi, '');
+      html = html.replace(/<script\b[^>]*\bsrc=["']([^"']*)["'][^>]*>\s*<\/script>/gi, (tag, src) => {
+        const routePath = '/' + path.relative(OUT_DIR, full);
+        const rel = new URL(src, 'http://local' + routePath).pathname.slice(1);
+        return publicScripts.some(script => script.path === rel && script.status === 'preserved-public') ? tag : '';
+      });
       html = html.replace(/<a\b([^>]*?)\s+aria-hidden=["']true["']/gi, '<a$1');
       html = html.replace(/<img\b([^>]*?)>/gi, (match, attrs) => {
         let updated = attrs;
@@ -245,3 +209,5 @@ fs.writeFileSync(path.join(OUT_DIR, 'package.json'), JSON.stringify(pkgJson, nul
 console.log(
   `✅ Stage 1 Mode C Universal Decompilation completed into ${OUT_DIR} (${unpackSummary.shaderCount} shaders, 0 legacy chunks).`
 );
+
+await finishNative(MIRROR_DIR, OUT_DIR, 'C', publicScripts);

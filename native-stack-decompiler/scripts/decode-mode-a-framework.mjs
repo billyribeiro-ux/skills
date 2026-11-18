@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { requireFreshOutput, finishNative, preservePublicScripts } from './native-recovery.mjs';
 import path from 'node:path';
 import postcss from 'postcss';
 import {
@@ -23,9 +24,8 @@ console.log(`🧩 Stage 1 Mode A Decompiler: Compiled VDOM Framework (Zero-Chunk
 console.log(`  Mirror Source: ${MIRROR_DIR}`);
 console.log(`  Output Native: ${OUT_DIR}`);
 
-if (fs.existsSync(OUT_DIR)) {
-  fs.rmSync(OUT_DIR, { recursive: true, force: true });
-}
+requireFreshOutput(MIRROR_DIR, OUT_DIR);
+const publicScripts = [];
 
 fs.mkdirSync(path.join(OUT_DIR, 'src', 'components'), { recursive: true });
 fs.mkdirSync(path.join(OUT_DIR, 'src', 'controllers'), { recursive: true });
@@ -40,7 +40,8 @@ const BANNED_JS_BUNDLE_PATH = /(?:^|\/)(?:_next\/static\/.*\.m?js|_astro\/.*\.m?
  */
 function copyAssetsExcludingChunks(src, dest, relFromRoot = '') {
   if (!fs.existsSync(src)) return;
-  const stat = fs.statSync(src);
+  const stat = fs.lstatSync(src);
+  if(stat.isSymbolicLink()) return;
   if (stat.isDirectory()) {
     if (['node_modules', '.git', '__sourcemaps__'].includes(path.basename(src))) return;
     fs.mkdirSync(dest, { recursive: true });
@@ -59,6 +60,7 @@ function copyAssetsExcludingChunks(src, dest, relFromRoot = '') {
 
 console.log(`📦 Copying verified media, fonts, stylesheets, and API fixtures (purging 100% of JS chunks)...`);
 copyAssetsExcludingChunks(MIRROR_DIR, OUT_DIR);
+publicScripts.push(...preservePublicScripts(MIRROR_DIR, OUT_DIR));
 
 // Load intrinsic image dimensions for Zero-CLS attribute enforcement
 let imageDimensions = {};
@@ -244,7 +246,7 @@ if (typeof window !== 'undefined') {
   }
 }
 `;
-fs.writeFileSync(path.join(OUT_DIR, 'src', 'main.js'), mainJs, 'utf8');
+if (!fs.existsSync(path.join(OUT_DIR, 'src','main.js'))) fs.writeFileSync(path.join(OUT_DIR, 'src', 'main.js'), mainJs, 'utf8');
 
 // Clean, strip ALL bundler/RSC scripts, enforce image dimensions & form A11y, and format multi-line HTML across all routes
 async function cleanAllRouteHtmlFiles(dir) {
@@ -261,7 +263,11 @@ async function cleanAllRouteHtmlFiles(dir) {
       html = resolveReactStreamingSuspenseHtml(html);
 
       // Strip ALL external bundler scripts (_next, turbopack, webpack, .min.js, .built.js) & RSC Flight/streaming scripts!
-      html = html.replace(/<script\b[^>]*\bsrc=["'][^"']*["'][^>]*>\s*<\/script>/gi, '');
+      html = html.replace(/<script\b[^>]*\bsrc=["']([^"']*)["'][^>]*>\s*<\/script>/gi, (tag, src) => {
+        const routePath = '/' + path.relative(OUT_DIR, full);
+        const rel = new URL(src, 'http://local' + routePath).pathname.slice(1);
+        return publicScripts.some(script => script.path === rel && script.status === 'preserved-public') ? tag : '';
+      });
       html = html.replace(/<script\b[^>]*>[\s\S]*?(?:self\.__next_f|__NEXT_DATA__|TURBOPACK|__webpack_require__|function\s+\$R[CSBX]\b|\$R[CSBX]\(|requestAnimationFrame\(function\(\)\{\$RT|\$RT=performance\.now)[\s\S]*?<\/script>/gi, '');
       html = html.replace(/<link\b[^>]*rel=["'](?:modulepreload|preload)["'][^>]*as=["']script["'][^>]*>/gi, '');
 
@@ -337,3 +343,5 @@ const pkgJson = {
 fs.writeFileSync(path.join(OUT_DIR, 'package.json'), JSON.stringify(pkgJson, null, 2), 'utf8');
 
 console.log(`✅ Stage 1 Mode A Decompilation completed cleanly into ${OUT_DIR} (0 bundler chunks).`);
+
+await finishNative(MIRROR_DIR, OUT_DIR, 'A', publicScripts);

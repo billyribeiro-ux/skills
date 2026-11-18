@@ -1,4 +1,5 @@
-enableGlobalVirtualStore: true
+enableGlobalVirtualStore: false
+nodeLinker: hoisted
 allowBuilds:
   esbuild: true
   isolated-vm: false

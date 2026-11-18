@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
@@ -525,17 +526,6 @@ export async function extractCdpForensics({ targetOrigin, routes, outDir }) {
         afterScrollMid: null
       };
 
-      for (const sh of runtimeAnimData.shaders) {
-        const hash = `${sh.type}:${sh.source.length}:${sh.source.slice(0, 120)}`;
-        if (!seenShaderHashes.has(hash)) {
-          seenShaderHashes.add(hash);
-          webglShaders.shaders.push({ route, ...sh });
-        }
-      }
-      for (const cv of runtimeAnimData.canvases) {
-        webglShaders.canvasContexts.push({ route, ...cv });
-      }
-
       // 2. CDP DOMDebugger.getEventListeners Inspection across Interactive Elements
       const listenerEntries = [];
       try {
@@ -675,7 +665,101 @@ export async function extractCdpForensics({ targetOrigin, routes, outDir }) {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(150);
 
-      // Refresh Canvas2D blueprint & extract inline SVGs BEFORE running pointer/click probes
+      // 3b. Interactive WebGL Canvas Hover & Hold Uniform Capture
+      const heroCanvasBox = await page.evaluate(() => {
+        const c = Array.from(document.querySelectorAll('canvas')).find((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width >= 100 && r.height >= 100 && r.top >= 0 && r.top < window.innerHeight;
+        });
+        if (!c) return null;
+        const r = c.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      });
+      if (heroCanvasBox && webglShaders.uniformProfiles[route]) {
+        await page.mouse.move(heroCanvasBox.x, heroCanvasBox.y);
+        await page.waitForTimeout(220);
+        webglShaders.uniformProfiles[route].afterHover = await page.evaluate(() =>
+          JSON.parse(JSON.stringify(window.__AGY_UNIFORM_TRACE__ || {}))
+        );
+        await page.mouse.down();
+        await page.waitForTimeout(650);
+        webglShaders.uniformProfiles[route].afterHold = await page.evaluate(() =>
+          JSON.parse(JSON.stringify(window.__AGY_UNIFORM_TRACE__ || {}))
+        );
+        await page.mouse.up();
+        await page.mouse.move(0, 0);
+        await page.waitForTimeout(150);
+      }
+
+      // 3c. Automated Interactive State Diff Probe (disclosures & tabs)
+      interactionContracts.routes[route].interactiveStates = await page.evaluate(async () => {
+        const states = [];
+        const selectorFor = (el) => {
+          if (el.id) return '#' + el.id;
+          const tag = el.tagName.toLowerCase();
+          const cls = typeof el.className === 'string'
+            ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.')
+            : '';
+          return cls ? `${tag}.${cls}` : tag;
+        };
+
+        for (const btn of Array.from(document.querySelectorAll('button[aria-expanded], [role="tab"]')).slice(0, 8)) {
+          const beforeExpanded = btn.getAttribute('aria-expanded');
+          const beforeSelected = btn.getAttribute('aria-selected');
+          const beforeState = btn.getAttribute('data-state');
+          const beforeClass = btn.className;
+          btn.click();
+          await new Promise((r) => setTimeout(r, 90));
+          const afterExpanded = btn.getAttribute('aria-expanded');
+          const afterSelected = btn.getAttribute('aria-selected');
+          const afterState = btn.getAttribute('data-state');
+          const changedAttr =
+            afterExpanded !== beforeExpanded
+              ? 'aria-expanded'
+              : afterSelected !== beforeSelected
+                ? 'aria-selected'
+                : afterState !== beforeState
+                  ? 'data-state'
+                  : btn.className !== beforeClass
+                    ? 'class'
+                    : null;
+          if (changedAttr) {
+            states.push({
+              selector: selectorFor(btn),
+              label: (btn.textContent || btn.getAttribute('aria-label') || '').trim().slice(0, 50),
+              action: 'click',
+              changedAttr,
+              beforeValue: beforeExpanded ?? beforeSelected ?? beforeState ?? beforeClass,
+              afterValue: afterExpanded ?? afterSelected ?? afterState ?? btn.className
+            });
+          }
+          // Restore disclosure state
+          if (changedAttr === 'aria-expanded') {
+            btn.click();
+            await new Promise((r) => setTimeout(r, 60));
+          }
+        }
+        return states;
+      });
+
+      // Read traces after all scroll and input probes so lazily compiled programs are included.
+      const finalWebGL = await page.evaluate(() => ({
+        shaders: window.__AGY_SHADERS__ || [],
+        contexts: window.__AGY_CANVASES__ || []
+      }));
+      for (const shader of finalWebGL.shaders) {
+        const digest = createHash('sha256').update(shader.source).digest('hex');
+        const identity = JSON.stringify([route, shader.type, digest, shader.canvasId, shader.canvasClass]);
+        if (!seenShaderHashes.has(identity)) {
+          seenShaderHashes.add(identity);
+          webglShaders.shaders.push({route, sha256: digest, ...shader});
+        }
+      }
+      for (const canvas of finalWebGL.contexts) {
+        webglShaders.canvasContexts.push({route, ...canvas});
+      }
+
+      // Refresh Canvas2D blueprint after full scroll + interactive passes so lazy canvases are captured
       canvas2dBlueprint.routes[route] = await page.evaluate(() =>
         Object.values(window.__AGY_CANVAS2D_OPS__ || {})
       );
@@ -698,88 +782,6 @@ export async function extractCdpForensics({ targetOrigin, routes, outDir }) {
         });
         return svgs.slice(0, 80);
       });
-
-      // 3b. Interactive WebGL Canvas Hover & Hold Uniform Capture (non-link canvases only)
-      try {
-        const heroCanvasBox = await page.evaluate(() => {
-          const c = Array.from(document.querySelectorAll('canvas')).find((el) => {
-            if (el.closest('a[href], button[type="submit"]')) return false;
-            const r = el.getBoundingClientRect();
-            return r.width >= 100 && r.height >= 100 && r.top >= 0 && r.top < window.innerHeight;
-          });
-          if (!c) return null;
-          const r = c.getBoundingClientRect();
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-        });
-        if (heroCanvasBox && webglShaders.uniformProfiles[route]) {
-          await page.mouse.move(heroCanvasBox.x, heroCanvasBox.y);
-          await page.waitForTimeout(220);
-          webglShaders.uniformProfiles[route].afterHover = await page.evaluate(() =>
-            JSON.parse(JSON.stringify(window.__AGY_UNIFORM_TRACE__ || {}))
-          );
-          await page.mouse.down();
-          await page.waitForTimeout(650);
-          webglShaders.uniformProfiles[route].afterHold = await page.evaluate(() =>
-            JSON.parse(JSON.stringify(window.__AGY_UNIFORM_TRACE__ || {}))
-          );
-          await page.mouse.up();
-          await page.mouse.move(0, 0);
-          await page.waitForTimeout(150);
-        }
-      } catch {}
-
-      // 3c. Automated Interactive State Diff Probe (disclosures & tabs outside navigation links/forms)
-      try {
-        interactionContracts.routes[route].interactiveStates = await page.evaluate(async () => {
-          const states = [];
-          const selectorFor = (el) => {
-            if (el.id) return '#' + el.id;
-            const tag = el.tagName.toLowerCase();
-            const cls = typeof el.className === 'string'
-              ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.')
-              : '';
-            return cls ? `${tag}.${cls}` : tag;
-          };
-
-          for (const btn of Array.from(document.querySelectorAll('button[aria-expanded], [role="tab"]')).slice(0, 8)) {
-            if (btn.closest('a[href], form') || btn.getAttribute('type') === 'submit') continue;
-            const beforeExpanded = btn.getAttribute('aria-expanded');
-            const beforeSelected = btn.getAttribute('aria-selected');
-            const beforeState = btn.getAttribute('data-state');
-            const beforeClass = btn.className;
-            btn.click();
-            await new Promise((r) => setTimeout(r, 90));
-            const afterExpanded = btn.getAttribute('aria-expanded');
-            const afterSelected = btn.getAttribute('aria-selected');
-            const afterState = btn.getAttribute('data-state');
-            const changedAttr =
-              afterExpanded !== beforeExpanded
-                ? 'aria-expanded'
-                : afterSelected !== beforeSelected
-                  ? 'aria-selected'
-                  : afterState !== beforeState
-                    ? 'data-state'
-                    : btn.className !== beforeClass
-                      ? 'class'
-                      : null;
-            if (changedAttr) {
-              states.push({
-                selector: selectorFor(btn),
-                label: (btn.textContent || btn.getAttribute('aria-label') || '').trim().slice(0, 50),
-                action: 'click',
-                changedAttr,
-                beforeValue: beforeExpanded ?? beforeSelected ?? beforeState ?? beforeClass,
-                afterValue: afterExpanded ?? afterSelected ?? afterState ?? btn.className
-              });
-            }
-            if (changedAttr === 'aria-expanded') {
-              btn.click();
-              await new Promise((r) => setTimeout(r, 60));
-            }
-          }
-          return states;
-        });
-      } catch {}
 
       await desktopCtx.close();
 
@@ -901,7 +903,7 @@ export async function extractCdpForensics({ targetOrigin, routes, outDir }) {
 }
 
 // Standalone CLI execution
-if (process.argv[1] && (path.resolve(process.argv[1]) === __filename || (fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename)))) {
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   const args = process.argv.slice(2);
   const getArg = (flag, fallback) => {
     const idx = args.indexOf(flag);

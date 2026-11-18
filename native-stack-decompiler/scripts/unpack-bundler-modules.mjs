@@ -378,7 +378,7 @@ export function convertFactoryToEsModule(factoryEntry, moduleNameMap) {
               astPath.parentPath.remove();
             }
           } else if (!importSource) {
-            astPath.replaceWith(t.objectExpression([]));
+            throw new Error(`Unresolved import ${depId} in module ${factoryEntry.moduleId}`);
           }
         }
       }
@@ -556,16 +556,21 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
   findJs(mirrorDir);
 
   const rawJsTexts = [];
+  const outcomes = [];
   const allFactories = new Map(); // modId -> factoryEntry
   const detectedVendors = new Set();
 
   for (const bf of bundleFiles) {
     const code = fs.readFileSync(bf, 'utf8');
     rawJsTexts.push(code);
-    const extracted = extractModuleFactoriesFromBundle(code, path.basename(bf));
+    const extracted = extractModuleFactoriesFromBundle(code, path.relative(mirrorDir, bf));
     for (const item of extracted) {
       if (!allFactories.has(item.moduleId)) {
         allFactories.set(item.moduleId, item);
+      } else {
+        const previous = allFactories.get(item.moduleId);
+        const identical = generate(previous.factoryNode).code === generate(item.factoryNode).code;
+        outcomes.push({moduleId:item.moduleId,sourceChunk:item.sourceChunk,status:identical?'duplicate':'unresolved',reason:identical?'Repeated identical module':'Module ID reused by a different factory'});
       }
     }
   }
@@ -605,6 +610,7 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
       const realTargetCode = generate(allFactories.get(realTargetId).factoryNode).code;
       const targetVendor = classifyVendorModule(realTargetCode);
       if (targetVendor) {
+        outcomes.push({moduleId:modId,sourceChunk:entry.sourceChunk,status:'vendor',package:targetVendor});
         moduleNameMap.set(modId, { vendorPkg: targetVendor === 'next-internal' ? 'next' : targetVendor });
         continue;
       }
@@ -617,6 +623,7 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
       rawFactoryCode.includes("Symbol.for('react.element')") ||
       (/\.jsx\s*=/.test(rawFactoryCode) && /\.jsxs\s*=/.test(rawFactoryCode) && rawFactoryCode.length < 4000);
     if (isJsxRuntimeImpl) {
+      outcomes.push({moduleId:modId,sourceChunk:entry.sourceChunk,status:'vendor',package:'react/jsx-runtime'});
       moduleNameMap.set(modId, { vendorPkg: 'react/jsx-runtime' });
       detectedVendors.add('react');
       continue;
@@ -624,6 +631,7 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
 
     const vendorPkg = classifyVendorModule(rawFactoryCode);
     if (vendorPkg) {
+      outcomes.push({moduleId:modId,sourceChunk:entry.sourceChunk,status:'vendor',package:vendorPkg});
       moduleNameMap.set(modId, { vendorPkg: vendorPkg === 'next-internal' ? 'next' : vendorPkg });
       if (vendorPkg !== 'next-internal' && vendorPkg !== 'scheduler') {
         detectedVendors.add(vendorPkg);
@@ -636,19 +644,7 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
       rawFactoryCode.includes('modelCols') ||
       rawFactoryCode.includes('modelRows');
 
-    // Skip giant (>60KB) unindentified vendor libraries (but NEVER drop data matrices or RSC modules)
-    if (rawFactoryCode.length > 60000 && !rscSymbols.has(modId) && !isStaticDataMatrix) {
-      continue;
-    }
-
-    // Skip trivial 1-line barrel/constant shims (< 45 chars)
-    if (rawFactoryCode.length < 45) continue;
-
     const semanticName = deriveSemanticModuleName(rawFactoryCode, modId, rscSymbols, usedNames);
-    // BANNED: Synthetic chunk names or anonymous fallback shards (DomainHelper*, UiSectionBlock*)
-    if (semanticName.startsWith('DomainHelper') || semanticName.startsWith('UiSectionBlock')) {
-      continue;
-    }
 
     const hasJsx =
       rscSymbols.has(modId) ||
@@ -712,12 +708,11 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
     try {
       const esCode = convertFactoryToEsModule(mod.entry, moduleNameMap);
       const humanized = await humanizeJavaScript(esCode, { jsx: mod.ext === '.jsx' });
-      const lines = humanized.split('\n');
-      if (lines.length > 1400) continue; // Respect strict 1,500-line modular cap
 
       const outFile = path.join(outNativeDir, 'src', mod.category, `${mod.semanticName}${mod.ext}`);
       fs.mkdirSync(path.dirname(outFile), { recursive: true });
       fs.writeFileSync(outFile, humanized, 'utf8');
+      outcomes.push({moduleId:mod.modId,sourceChunk:mod.entry.sourceChunk,status:'reconstructed',outputPath:path.relative(outNativeDir,outFile)});
       writtenAuthorCount++;
       moduleIndex.push({
         moduleId: mod.modId,
@@ -725,8 +720,12 @@ export async function unpackAllMirrorBundles(mirrorDir, outNativeDir) {
         rscExport: rscSymbols.get(mod.modId)?.exportName || null,
         sourcePath: `src/${mod.category}/${mod.semanticName}${mod.ext}`
       });
-    } catch {}
+    } catch (error) {
+      outcomes.push({moduleId:mod.modId,sourceChunk:mod.entry.sourceChunk,status:'unresolved',reason:error.message});
+    }
   }
+  fs.mkdirSync(path.join(outNativeDir,'forensics'),{recursive:true});
+  fs.writeFileSync(path.join(outNativeDir,'forensics','module-outcomes.json'),JSON.stringify({version:1,modules:outcomes},null,2));
 
   if (moduleIndex.length > 0) {
     fs.mkdirSync(path.join(outNativeDir, 'src', 'data'), { recursive: true });

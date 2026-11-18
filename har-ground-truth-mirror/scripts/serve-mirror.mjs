@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import http from 'node:http';
+import {createReplayLookup} from '../../shared/replay-index.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 
 const args = process.argv.slice(2);
 const getArg = (flag, fallback) => {
@@ -65,13 +65,6 @@ const STREAMABLE_EXTS = new Set([
   '.glb'
 ]);
 
-function getQueryKeyedRelPath(relPath, search) {
-  if (!search || search === '?') return relPath;
-  const ext = path.extname(relPath);
-  const qHash = crypto.createHash('sha1').update(search).digest('hex').slice(0, 12);
-  return `${relPath}__q_${qHash}${ext}`;
-}
-
 function findApiFixture(fixtureDir, pathname, search, isRSC) {
   if (!fs.existsSync(fixtureDir)) return null;
   const ext = isRSC ? 'rsc' : 'json';
@@ -90,7 +83,18 @@ function findApiFixture(fixtureDir, pathname, search, isRSC) {
   return match ? path.join(fixtureDir, match) : null;
 }
 
+function readManifest(relativePath) {
+  const file = path.join(ROOT_DIR, relativePath);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
+}
+
 function startServer(port) {
+  const assets = readManifest('forensics/assets.json');
+  const lookup = createReplayLookup({
+    assets,
+    routes: readManifest('forensics/routes-manifest.json'),
+    fixtures: readManifest('__api_fixtures__/manifest.json')
+  });
   const server = http.createServer((req, res) => {
     const rawUrl = req.url || '/';
     const parsedUrl = new URL(rawUrl, `http://${req.headers.host || 'localhost'}`);
@@ -137,7 +141,8 @@ function startServer(port) {
 
     // 2. API Fixtures & RSC Streams
     const fixtureDir = path.join(ROOT_DIR, '__api_fixtures__');
-    const matchedFixture = findApiFixture(fixtureDir, pathname, parsedUrl.search, isRSC);
+    const indexed = lookup(rawUrl, {method: req.method, isRSC});
+    const matchedFixture = !assets && findApiFixture(fixtureDir, pathname, parsedUrl.search, isRSC);
     if (matchedFixture) {
       res.writeHead(200, {
         'Content-Type': isRSC ? 'text/x-component; charset=utf-8' : 'application/json; charset=utf-8',
@@ -148,10 +153,9 @@ function startServer(port) {
       return;
     }
 
-    // 3. Static Asset & Next.js /_next/image Resolution (supporting both decoded, raw, & query-keyed paths)
+    // 3. Static Asset & Next.js /_next/image Resolution (supporting both decoded & raw encoded paths)
     let targetRelPath = pathname.replace(/^\/+/, '');
     const rawRelPath = rawPathname.replace(/^\/+/, '');
-    let assetSearch = parsedUrl.search;
 
     if (pathname === '/_next/image') {
       const imgParam = parsedUrl.searchParams.get('url');
@@ -161,30 +165,17 @@ function startServer(port) {
           try {
             const u = new URL(decoded);
             targetRelPath = path.join('__external', u.hostname, decodeURIComponent(u.pathname).replace(/^\/+/, ''));
-            if (u.search) assetSearch = u.search;
           } catch {
             targetRelPath = decoded.replace(/^\/+/, '');
           }
         } else {
-          const qIdx = decoded.indexOf('?');
-          targetRelPath = (qIdx !== -1 ? decoded.slice(0, qIdx) : decoded).replace(/^\/+/, '');
-          if (qIdx !== -1) assetSearch = decoded.slice(qIdx);
+          targetRelPath = decoded.replace(/^\/+/, '');
         }
       }
     }
 
-    const candidates = [];
-    if (assetSearch && assetSearch !== '?') {
-      const qTarget = getQueryKeyedRelPath(targetRelPath, assetSearch);
-      const qRaw = getQueryKeyedRelPath(rawRelPath, assetSearch);
-      candidates.push(
-        path.join(ROOT_DIR, qTarget),
-        path.join(ROOT_DIR, qRaw),
-        path.join(ROOT_DIR, '__external', qTarget),
-        path.join(ROOT_DIR, '__external', qRaw)
-      );
-    }
-    candidates.push(
+    const candidates = [
+      ...(indexed ? [path.join(ROOT_DIR, indexed.file)] : []),
       path.join(ROOT_DIR, targetRelPath === '' ? 'index.html' : targetRelPath),
       path.join(ROOT_DIR, rawRelPath === '' ? 'index.html' : rawRelPath),
       path.join(ROOT_DIR, targetRelPath, 'index.css'),
@@ -192,7 +183,7 @@ function startServer(port) {
       path.join(ROOT_DIR, `${targetRelPath}.html`),
       path.join(ROOT_DIR, '__external', targetRelPath),
       path.join(ROOT_DIR, '__external', rawRelPath)
-    );
+    ];
 
     const filePath = candidates.find((f) => fs.existsSync(f) && fs.statSync(f).isFile());
 
@@ -221,7 +212,7 @@ function startServer(port) {
 
     const stat = fs.statSync(filePath);
     const ext = path.extname(filePath).toLowerCase();
-    const contentType = MIME_MAP[ext] || 'application/octet-stream';
+    const contentType = indexed?.contentType || MIME_MAP[ext] || 'application/octet-stream';
 
     // 4. HTTP 206 Partial Content Byte-Range Streaming
     const range = req.headers.range;
@@ -277,7 +268,7 @@ function startServer(port) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`📡 Stage 0 Ground-Truth Mirror Server listening on http://localhost:${port}`);
+    console.log(`📡 Stage 0 Ground-Truth Mirror Server listening on http://localhost:${server.address().port}`);
     console.log(`📁 Serving Root: ${ROOT_DIR}`);
   });
 

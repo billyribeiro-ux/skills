@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
-import { invalidateStageCert, mintStageCert } from '../../shared/pipeline-gate.mjs';
+import { invalidateStageCert, mintStageCert, manifestRoutes as loadManifestRoutes } from '../../shared/pipeline-gate.mjs';
 
 const args = process.argv.slice(2);
 const getArg = (flag, fallback) => {
@@ -28,17 +29,8 @@ if (!LIVE_URL) {
 }
 
 // Auto-load ALL captured routes from forensics/routes-manifest.json unless overridden
-const routesManifestPath = path.join(MIRROR_DIR, 'forensics', 'routes-manifest.json');
 const explicitRoutes = getArg('--routes', '');
-let manifestRoutes = ['/'];
-if (fs.existsSync(routesManifestPath)) {
-  try {
-    const manifest = JSON.parse(fs.readFileSync(routesManifestPath, 'utf8'));
-    if (Array.isArray(manifest.routes) && manifest.routes.length > 0) {
-      manifestRoutes = manifest.routes.map((r) => (typeof r === 'string' ? r : r.route));
-    }
-  } catch { }
-}
+const manifestRoutes = loadManifestRoutes(MIRROR_DIR);
 
 const ROUTES = explicitRoutes
   ? explicitRoutes.split(',').map((r) => r.trim()).filter(Boolean)
@@ -121,12 +113,7 @@ const TELEMETRY_HOSTS = [
   'hs-scripts.com',
   'snitcher.com',
   'trysurface',
-  'posthog',
-  'r.stripe.com',
-  'm.stripe.com',
-  'm.stripe.network',
-  'q.stripe.com',
-  'errors.stripe.com'
+  'posthog'
 ];
 
 async function inspectSurface(page, isLocalAirgap) {
@@ -145,94 +132,12 @@ async function inspectSurface(page, isLocalAirgap) {
     } catch { }
   }
 
-  // Deterministic canvas-scoped O(1) PRNG + RAF Lockstep Clock + Deferred Long Timers — ZERO canvas masking, ZERO video hiding!
+  // Deterministic PRNG — ZERO canvas masking, ZERO video hiding!
   await page.addInitScript(() => {
-    const hashStr = (str) => {
-      let h = 2166136261 >>> 0;
-      for (let i = 0; i < str.length; i++) {
-        h ^= str.charCodeAt(i);
-        h = Math.imul(h, 16777619) >>> 0;
-      }
-      return h || 1337;
-    };
-    let defaultSeed = 1337;
-    let activeSeed = 1337;
-    let usingCanvasSeed = false;
-    const ctxCounts = Object.create(null);
-    const origGetContext = HTMLCanvasElement.prototype.getContext;
-    HTMLCanvasElement.prototype.getContext = function (type, ...args) {
-      const ctx = origGetContext.call(this, type, ...args);
-      if (ctx) {
-        const key = String(type || '2d');
-        ctxCounts[key] = (ctxCounts[key] || 0) + 1;
-        activeSeed = hashStr(`${key}:${ctxCounts[key]}`);
-        usingCanvasSeed = true;
-        queueMicrotask(() => {
-          usingCanvasSeed = false;
-        });
-      }
-      return ctx;
-    };
+    let seed = 1337;
     Math.random = () => {
-      if (usingCanvasSeed) {
-        activeSeed = (Math.imul(activeSeed, 1664525) + 1013904223) >>> 0;
-        return activeSeed / 4294967296;
-      }
-      defaultSeed = (Math.imul(defaultSeed, 1664525) + 1013904223) >>> 0;
-      return defaultSeed / 4294967296;
-    };
-
-    let virtualNowMs = 1000;
-    try {
-      Object.defineProperty(performance, 'now', { value: () => virtualNowMs, configurable: true });
-    } catch { }
-
-    const origSetTimeout = window.setTimeout.bind(window);
-    const origClearTimeout = window.clearTimeout.bind(window);
-    window.__AGY_RAW_SET_TIMEOUT__ = origSetTimeout;
-    window.__AGY_LONG_TIMERS__ = [];
-    window.setTimeout = (fn, delay = 0, ...rest) => {
-      if (typeof fn === 'function' && Number(delay) >= 3000) {
-        const entry = { fn, rest, cancelled: false };
-        window.__AGY_LONG_TIMERS__.push(entry);
-        return 900000 + window.__AGY_LONG_TIMERS__.length;
-      }
-      return origSetTimeout(fn, delay, ...rest);
-    };
-    window.clearTimeout = (id) => {
-      if (typeof id === 'number' && id >= 900001) {
-        const entry = window.__AGY_LONG_TIMERS__[id - 900001];
-        if (entry) entry.cancelled = true;
-        return;
-      }
-      return origClearTimeout(id);
-    };
-
-    let nextRafId = 1;
-    const rafQueue = new Map();
-    const cancelledRafs = new Set();
-    window.requestAnimationFrame = (cb) => {
-      const id = nextRafId++;
-      rafQueue.set(id, cb);
-      return id;
-    };
-    window.cancelAnimationFrame = (id) => {
-      cancelledRafs.add(id);
-      rafQueue.delete(id);
-    };
-    window.__AGY_STEP_RAF__ = (frames = 60, dt = 16) => {
-      for (let f = 0; f < frames; f++) {
-        virtualNowMs += dt;
-        const batch = Array.from(rafQueue.entries());
-        rafQueue.clear();
-        for (const [id, cb] of batch) {
-          if (!cancelledRafs.has(id)) {
-            try {
-              cb(virtualNowMs);
-            } catch { }
-          }
-        }
-      }
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 4294967296;
     };
   });
 
@@ -291,13 +196,9 @@ async function freezeFrameDeterministically(page) {
           anim.currentTime = 0;
           anim.pause();
         } else if (anim.playState === 'running') {
-          try {
-            anim.finish();
-          } catch {
-            const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
-            if (Number.isFinite(end) && end > 0) anim.currentTime = end;
-            anim.pause();
-          }
+          const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
+          if (Number.isFinite(end) && end > 0) anim.currentTime = end;
+          anim.pause();
         }
       } catch { }
     }
@@ -350,6 +251,7 @@ async function run() {
     'kinetic-scroll-matrix.json',
     'interaction-contracts.json',
     'dom-component-blueprint.json',
+    'canvas2d-blueprint.json',
     'webgl-shaders.json'
   ];
   for (const reqFile of requiredForensics) {
@@ -357,6 +259,29 @@ async function run() {
     if (!fs.existsSync(fp)) {
       console.error(`❌ Missing mandatory Stage 0 CDP forensic artifact: forensics/${reqFile}`);
       totalFailures++;
+    } else {
+      try {
+        const doc = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        if (['animations-blueprint.json', 'kinetic-scroll-matrix.json', 'interaction-contracts.json', 'dom-component-blueprint.json', 'canvas2d-blueprint.json'].includes(reqFile) && !ROUTES.every(route => Object.hasOwn(doc.routes || {}, route))) {
+          throw new Error('Missing forensic route');
+        }
+      } catch (error) {
+        console.error(reqFile, error.message);
+        totalFailures++;
+      }
+    }
+  }
+
+  const capture = JSON.parse(fs.readFileSync(path.join(MIRROR_DIR, 'forensics/routes-manifest.json'), 'utf8'));
+  if (capture.captureVersion === 2) {
+    const digestMatches = (file, expected) => typeof file === 'string' && fs.existsSync(path.join(MIRROR_DIR, file)) &&
+      createHash('sha256').update(fs.readFileSync(path.join(MIRROR_DIR, file))).digest('hex') === expected;
+    const maps = JSON.parse(fs.readFileSync(path.join(MIRROR_DIR, 'forensics/source-maps.json'), 'utf8'));
+    const assets = JSON.parse(fs.readFileSync(path.join(MIRROR_DIR, 'forensics/assets.json'), 'utf8'));
+    if (!maps.maps.every(map => digestMatches(map.file, map.sha256)) ||
+        !capture.routes.every(route => digestMatches(route.rawDocument, route.rawSha256)) ||
+        !assets.assets.every(asset => typeof asset.relPath === 'string' && fs.existsSync(path.join(MIRROR_DIR, asset.relPath)) && digestMatches(asset.rawFile, asset.sha256))) {
+      throw new Error('Captured document, source map or listed asset is missing or inconsistent.');
     }
   }
 
@@ -409,8 +334,8 @@ async function run() {
       const localMonitor = await inspectSurface(localPage, true);
 
       const [liveRes, localRes] = await Promise.all([
-        livePage.goto(liveTarget, { waitUntil: 'load', timeout: 45000 }),
-        localPage.goto(localTarget, { waitUntil: 'load', timeout: 45000 })
+        livePage.goto(liveTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }),
+        localPage.goto(localTarget, { waitUntil: 'domcontentloaded', timeout: 45000 })
       ]);
 
       if (!localRes || localRes.status() >= 400) {
@@ -422,14 +347,10 @@ async function run() {
         livePage.evaluate(() => document.fonts?.ready).catch(() => { }),
         localPage.evaluate(() => document.fonts?.ready).catch(() => { })
       ]);
-      await Promise.all([livePage.waitForTimeout(1200), localPage.waitForTimeout(1200)]);
-      await Promise.all([
-        livePage.evaluate(() => window.__AGY_STEP_RAF__?.(90, 16)),
-        localPage.evaluate(() => window.__AGY_STEP_RAF__?.(90, 16))
-      ]);
+      await Promise.all([livePage.waitForTimeout(1800), localPage.waitForTimeout(1800)]);
 
       await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
-      await Promise.all([livePage.waitForTimeout(120), localPage.waitForTimeout(120)]);
+      await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
 
       // Scroll Height Delta (<= 8px)
       const [liveHeight, localHeight] = await Promise.all([
@@ -485,6 +406,10 @@ async function run() {
 
       const [liveLandmarks, localLandmarks] = await Promise.all([grabLandmarks(livePage), grabLandmarks(localPage)]);
       let landmarkMaxDelta = 0;
+      if (liveLandmarks.length !== localLandmarks.length) {
+        console.error('Landmark count differs', liveLandmarks.length, localLandmarks.length);
+        totalFailures++;
+      }
       const count = Math.min(liveLandmarks.length, localLandmarks.length);
       for (let i = 0; i < count; i++) {
         landmarkMaxDelta = Math.max(
@@ -500,70 +425,22 @@ async function run() {
       }
 
       // Unmasked Pixelmatch Visual Diff across scroll checkpoints (<= 0.5%)
-      const waitVisibleMedia = (p) =>
-        p.evaluate(() => {
-          const rawTimer = window.__AGY_RAW_SET_TIMEOUT__ || window.setTimeout;
-          return Promise.race([
-            Promise.all([
-              ...Array.from(document.images)
-                .filter((img) => {
-                  const r = img.getBoundingClientRect();
-                  return r.width > 0 && r.height > 0 && r.bottom > -200 && r.top < window.innerHeight + 200;
-                })
-                .map(
-                  (img) =>
-                    new Promise((res) => {
-                      if (img.complete && img.naturalWidth > 0) return res();
-                      rawTimer(res, 900);
-                      img.decode().then(res, res);
-                    })
-                ),
-              ...Array.from(document.querySelectorAll('video'))
-                .filter((v) => {
-                  const r = v.getBoundingClientRect();
-                  return r.width > 0 && r.height > 0 && r.bottom > -100 && r.top < window.innerHeight + 100;
-                })
-                .map(
-                  (v) =>
-                    new Promise((res) => {
-                      if (v.readyState >= 2) return res();
-                      const done = () => {
-                        v.removeEventListener('loadeddata', done);
-                        v.removeEventListener('error', done);
-                        res();
-                      };
-                      v.addEventListener('loadeddata', done, { once: true });
-                      v.addEventListener('error', done, { once: true });
-                      rawTimer(done, 1200);
-                    })
-                )
-            ]),
-            new Promise((r) => rawTimer(r, 1500))
-          ]);
-        }).catch(() => {});
-
       for (const ratio of SCROLL_CHECKPOINTS) {
         const liveY = Math.round(Math.max(0, liveHeight - vp.height) * ratio);
         const localY = Math.round(Math.max(0, localHeight - vp.height) * ratio);
 
-        const prepCheckpoint = async (p, y) => {
-          await p.evaluate((top) => window.scrollTo({ top, behavior: 'instant' }), y);
-          await p.waitForTimeout(220);
-          await p.evaluate(() => window.__AGY_STEP_RAF__?.(96, 16));
-          await waitVisibleMedia(p);
-          await freezeFrameDeterministically(p);
-          await p.waitForTimeout(60);
-        };
-
-        await Promise.race([
-          Promise.all([prepCheckpoint(livePage, liveY), prepCheckpoint(localPage, localY)]),
-          new Promise((_, rej) => setTimeout(() => rej(new Error(`Checkpoint ${ratio} prep timed out`)), 12000))
+        await Promise.all([
+          livePage.evaluate((y) => window.scrollTo(0, y), liveY),
+          localPage.evaluate((y) => window.scrollTo(0, y), localY)
         ]);
+        await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
+        await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
+        await Promise.all([livePage.waitForTimeout(150), localPage.waitForTimeout(150)]);
 
         await livePage.bringToFront();
-        const liveShot = await livePage.screenshot({ animations: 'allow', timeout: 10000 });
+        const liveShot = await livePage.screenshot({ timeout: 10000 });
         await localPage.bringToFront();
-        const localShot = await localPage.screenshot({ animations: 'allow', timeout: 10000 });
+        const localShot = await localPage.screenshot({ timeout: 10000 });
         const imgLive = PNG.sync.read(liveShot);
         const imgLocal = PNG.sync.read(localShot);
         const diff = new PNG({ width: vp.width, height: vp.height });

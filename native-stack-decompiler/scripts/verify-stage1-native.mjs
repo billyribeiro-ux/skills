@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
+import { verifyReconstruction } from './continue-native.mjs';
 import { assertStageCertified, invalidateStageCert, mintStageCert } from '../../shared/pipeline-gate.mjs';
 import { auditKineticAndLivingSurface, installKineticObserver } from '../../shared/kinetic-verifier.mjs';
 
@@ -233,7 +234,13 @@ async function run() {
 
   // Invalidate stale Stage 1 cert immediately & require certified Stage 0 mirror
   invalidateStageCert(1, NATIVE_DIR);
-  assertStageCertified({ requiredStage: 0, dir: MIRROR_DIR, callerName: 'verify-stage1-native.mjs' });
+  const mirrorCert = assertStageCertified({ requiredStage: 0, dir: MIRROR_DIR, callerName: 'verify-stage1-native.mjs' });
+  const ledger = JSON.parse(fs.readFileSync(path.join(NATIVE_DIR,'forensics','source-recovery.json'),'utf8'));
+  if (ledger.runtimeStatus === 'reconstructed-runtime') {
+    verifyReconstruction(fs.realpathSync(NATIVE_DIR), fs.realpathSync(MIRROR_DIR), ledger, mirrorCert);
+  } else if (!['source-built-runtime','static-route-runtime'].includes(ledger.runtimeStatus)) {
+    throw new Error('Native runtime remains incomplete. See forensics/source-recovery.json for unresolved modules and scripts.');
+  }
 
   // Verify both servers return HTTP 200 OK
   for (const [label, url] of [
@@ -359,10 +366,11 @@ async function run() {
           sampleKineticScrollState(mirrorPage),
           sampleKineticScrollState(nativePage)
         ]);
+        kineticDriftCount += Math.abs(stateM.length - stateN.length);
         const len = Math.min(stateM.length, stateN.length);
         for (let i = 0; i < len; i++) {
           if (
-            Math.abs(stateM[i].top - stateN[i].top) > 4 ||
+            stateM[i].tag !== stateN[i].tag || Math.abs(stateM[i].top - stateN[i].top) > 4 ||
             Math.abs(stateM[i].opacity - stateN[i].opacity) > 0.15
           ) {
             kineticDriftCount++;
@@ -400,6 +408,7 @@ async function run() {
           landmarkQuery)
       ]);
 
+      if (nativeLandmarks.length !== mirrorLandmarks.length) { console.error('Landmark count differs'); totalFailures++; }
       let landmarkMaxDelta = 0;
       const lmCount = Math.min(mirrorLandmarks.length, nativeLandmarks.length);
       for (let i = 0; i < lmCount; i++) {
