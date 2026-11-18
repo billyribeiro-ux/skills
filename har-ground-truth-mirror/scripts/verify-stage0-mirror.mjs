@@ -468,6 +468,10 @@ async function run() {
       }
 
       await Promise.all([
+        livePage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { }),
+        localPage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { })
+      ]);
+      await Promise.all([
         livePage.evaluate(() => document.fonts?.ready).catch(() => { }),
         localPage.evaluate(() => document.fonts?.ready).catch(() => { })
       ]);
@@ -562,15 +566,16 @@ async function run() {
         const localY = Math.round(Math.max(0, localHeight - vp.height) * ratio);
 
         await Promise.all([
-          livePage.evaluate((y) => {
-            window.scrollTo(0, y);
-            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(1000);
-          }, liveY),
-          localPage.evaluate((y) => {
-            window.scrollTo(0, y);
-            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(1000);
-          }, localY)
+          livePage.evaluate((y) => window.scrollTo(0, y), liveY),
+          localPage.evaluate((y) => window.scrollTo(0, y), localY)
         ]);
+        await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
+        if (liveY > 0 || localY > 0) {
+          await Promise.all([
+            livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
+            localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
+          ]);
+        }
         await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
         await Promise.all([
           livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
