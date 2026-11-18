@@ -173,7 +173,7 @@ async function inspectSurface(page, isLocalAirgap) {
     };
 
     let virtualNowMs = 1000;
-    let targetVirtualMs = 1960;
+    let targetVirtualMs = 1000;
     try {
       Object.defineProperty(performance, 'now', { value: () => virtualNowMs, configurable: true });
     } catch { }
@@ -460,10 +460,14 @@ async function run() {
         livePage.evaluate(() => document.fonts?.ready).catch(() => { }),
         localPage.evaluate(() => document.fonts?.ready).catch(() => { })
       ]);
-      await Promise.all([livePage.waitForTimeout(1800), localPage.waitForTimeout(1800)]);
+      await Promise.all([livePage.waitForTimeout(1000), localPage.waitForTimeout(1000)]);
       await Promise.all([
-        livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 3000 }).catch(() => { }),
-        localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 3000 }).catch(() => { })
+        livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
+        localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
+      ]);
+      await Promise.all([
+        livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
+        localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { })
       ]);
 
       await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
@@ -549,17 +553,17 @@ async function run() {
         await Promise.all([
           livePage.evaluate((y) => {
             window.scrollTo(0, y);
-            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(256);
+            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(1000);
           }, liveY),
           localPage.evaluate((y) => {
             window.scrollTo(0, y);
-            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(256);
+            if (y > 0) window.__AGY_ADVANCE_CLOCK__?.(1000);
           }, localY)
         ]);
         await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
         await Promise.all([
-          livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 2500 }).catch(() => { }),
-          localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 2500 }).catch(() => { })
+          livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
+          localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { })
         ]);
         await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
         await Promise.all([livePage.waitForTimeout(150), localPage.waitForTimeout(150)]);

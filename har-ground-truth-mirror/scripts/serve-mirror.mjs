@@ -122,7 +122,7 @@ function startServer(port) {
       return;
     }
 
-    if (pathname.includes('logger-transport-iframe')) {
+    if (pathname.includes('logger-transport-iframe') || pathname.startsWith('/__external/m.stripe.network/')) {
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Access-Control-Allow-Origin': '*'
