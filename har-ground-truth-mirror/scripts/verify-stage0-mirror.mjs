@@ -436,43 +436,42 @@ async function run() {
     ]
   });
 
-  for (const route of ROUTES) {
+  const gotoWithRetry = async (page, target) => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        return await page.goto(target, { waitUntil: 'load', timeout: 45000 });
+      } catch (err) {
+        if (attempt === 3) throw err;
+        await page.waitForTimeout(1000 * attempt);
+      }
+    }
+  };
+
+  const auditPair = async ({ route, vp }) => {
     const liveTarget = new URL(route, LIVE_URL).href;
     const localTarget = new URL(route, LOCAL_URL).href;
+    const logs = [`\n----------------------------------------`, `Checking Route: ${route} | 📱 Viewport: ${vp.name} (${vp.width}x${vp.height})`];
+    const errs = [];
+    let pairFailures = 0;
+    const pairComparisons = [];
 
-    console.log(`\n----------------------------------------`);
-    console.log(`Checking Route: ${route}`);
+    const liveCtx = await browser.newContext({
+      viewport: { width: vp.width, height: vp.height },
+      isMobile: vp.isMobile,
+      hasTouch: vp.hasTouch
+    });
+    const localCtx = await browser.newContext({
+      viewport: { width: vp.width, height: vp.height },
+      isMobile: vp.isMobile,
+      hasTouch: vp.hasTouch
+    });
 
-    for (const vp of VIEWPORTS) {
-      console.log(`  📱 Viewport: ${vp.name} (${vp.width}x${vp.height})`);
-
-      const liveCtx = await browser.newContext({
-        viewport: { width: vp.width, height: vp.height },
-        isMobile: vp.isMobile,
-        hasTouch: vp.hasTouch
-      });
-      const localCtx = await browser.newContext({
-        viewport: { width: vp.width, height: vp.height },
-        isMobile: vp.isMobile,
-        hasTouch: vp.hasTouch
-      });
-
+    try {
       const livePage = await liveCtx.newPage();
       const localPage = await localCtx.newPage();
 
       const liveMonitor = await inspectSurface(livePage, false);
       const localMonitor = await inspectSurface(localPage, true);
-
-      const gotoWithRetry = async (page, target) => {
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            return await page.goto(target, { waitUntil: 'load', timeout: 45000 });
-          } catch (err) {
-            if (attempt === 3) throw err;
-            await page.waitForTimeout(1000 * attempt);
-          }
-        }
-      };
 
       const [liveRes, localRes] = await Promise.all([
         gotoWithRetry(livePage, liveTarget),
@@ -480,8 +479,8 @@ async function run() {
       ]);
 
       if (!localRes || localRes.status() >= 400) {
-        console.error(`  ❌ Local route ${route} returned HTTP ${localRes?.status() ?? 'ERR'}`);
-        totalFailures++;
+        errs.push(`  ❌ Local route ${route} returned HTTP ${localRes?.status() ?? 'ERR'}`);
+        pairFailures++;
       }
 
       await Promise.all([livePage.waitForTimeout(500), localPage.waitForTimeout(500)]);
@@ -502,13 +501,9 @@ async function run() {
         livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
         localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
       ]);
-      await Promise.all([
-        livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
-        localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { })
-      ]);
 
       await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
-      await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
+      await Promise.all([livePage.waitForTimeout(200), localPage.waitForTimeout(200)]);
 
       // Scroll Height Delta (<= 8px)
       const [liveHeight, localHeight] = await Promise.all([
@@ -516,10 +511,10 @@ async function run() {
         localPage.evaluate(() => document.documentElement.scrollHeight)
       ]);
       const heightDelta = Math.abs(liveHeight - localHeight);
-      console.log(`    Scroll Height: Live=${liveHeight}px | Local=${localHeight}px | Delta=${heightDelta}px`);
+      logs.push(`    Scroll Height: Live=${liveHeight}px | Local=${localHeight}px | Delta=${heightDelta}px`);
       if (heightDelta > 8) {
-        console.error(`    ❌ Scroll height delta ${heightDelta}px exceeded 8px limit!`);
-        totalFailures++;
+        errs.push(`    ❌ Scroll height delta ${heightDelta}px exceeded 8px limit!`);
+        pairFailures++;
       }
 
       // Surface Buffer Integrity (Images, Videos, Canvases — NO MASKING)
@@ -542,12 +537,12 @@ async function run() {
       });
 
       if (bufferAudit.brokenImages > 0) {
-        console.error(`    ❌ Broken visible images on local mirror: ${bufferAudit.brokenImages}`);
-        totalFailures++;
+        errs.push(`    ❌ Broken visible images on local mirror: ${bufferAudit.brokenImages}`);
+        pairFailures++;
       }
       if (bufferAudit.unreadyVideos > 0) {
-        console.error(`    ❌ Unready visible videos on local mirror: ${bufferAudit.unreadyVideos}`);
-        totalFailures++;
+        errs.push(`    ❌ Unready visible videos on local mirror: ${bufferAudit.unreadyVideos}`);
+        pairFailures++;
       }
 
       // Landmark Bounding Box Parity (<= 2px)
@@ -565,8 +560,8 @@ async function run() {
       const [liveLandmarks, localLandmarks] = await Promise.all([grabLandmarks(livePage), grabLandmarks(localPage)]);
       let landmarkMaxDelta = 0;
       if (liveLandmarks.length !== localLandmarks.length) {
-        console.error('Landmark count differs', liveLandmarks.length, localLandmarks.length);
-        totalFailures++;
+        errs.push(`    ❌ Landmark count differs: live=${liveLandmarks.length} local=${localLandmarks.length}`);
+        pairFailures++;
       }
       const count = Math.min(liveLandmarks.length, localLandmarks.length);
       for (let i = 0; i < count; i++) {
@@ -576,10 +571,10 @@ async function run() {
           Math.abs(liveLandmarks[i].height - localLandmarks[i].height)
         );
       }
-      console.log(`    Landmark Max Delta: ${landmarkMaxDelta}px`);
+      logs.push(`    Landmark Max Delta: ${landmarkMaxDelta}px`);
       if (landmarkMaxDelta > 2) {
-        console.error(`    ❌ Landmark delta ${landmarkMaxDelta}px exceeded 2px limit!`);
-        totalFailures++;
+        errs.push(`    ❌ Landmark delta ${landmarkMaxDelta}px exceeded 2px limit!`);
+        pairFailures++;
       }
 
       // Unmasked Pixelmatch Visual Diff across scroll checkpoints (<= 0.5%)
@@ -605,17 +600,13 @@ async function run() {
         } else {
           await Promise.all([livePage.waitForTimeout(200), localPage.waitForTimeout(200)]);
         }
-        await Promise.all([
-          livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
-          localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { })
-        ]);
         await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
         await Promise.all([livePage.waitForTimeout(100), localPage.waitForTimeout(100)]);
 
-        await livePage.bringToFront();
-        const liveShot = await livePage.screenshot({ timeout: 10000 });
-        await localPage.bringToFront();
-        const localShot = await localPage.screenshot({ timeout: 10000 });
+        const [liveShot, localShot] = await Promise.all([
+          livePage.screenshot({ timeout: 15000 }),
+          localPage.screenshot({ timeout: 15000 })
+        ]);
         const imgLive = PNG.sync.read(liveShot);
         const imgLocal = PNG.sync.read(localShot);
         const diff = new PNG({ width: vp.width, height: vp.height });
@@ -631,9 +622,9 @@ async function run() {
 
         const totalPixels = vp.width * vp.height;
         const diffPct = (mismatchedPixels / totalPixels) * 100;
-        console.log(`    Scroll ${Math.round(ratio * 100)}%: Unmasked Diff = ${diffPct.toFixed(3)}% (${mismatchedPixels} px)`);
+        logs.push(`    Scroll ${Math.round(ratio * 100)}%: Unmasked Diff = ${diffPct.toFixed(3)}% (${mismatchedPixels} px)`);
 
-        comparisons.push({
+        pairComparisons.push({
           route,
           viewport: vp.name,
           scrollPercent: Math.round(ratio * 100),
@@ -646,23 +637,23 @@ async function run() {
           const safeRoute = route.replace(/\//g, '_') || 'root';
           const diffFile = path.join(REPORT_DIR, `diff-${safeRoute}-${vp.name}-${Math.round(ratio * 100)}.png`);
           fs.writeFileSync(diffFile, PNG.sync.write(diff));
-          console.error(`    ❌ Unmasked visual diff ${diffPct.toFixed(2)}% exceeded ${MAX_DIFF_PERCENT}%! Saved: ${diffFile}`);
-          totalFailures++;
+          errs.push(`    ❌ Unmasked visual diff ${diffPct.toFixed(2)}% exceeded ${MAX_DIFF_PERCENT}%! Saved: ${diffFile}`);
+          pairFailures++;
         }
       }
 
       // Network, Console & Airgap Escape Checks (evaluated AFTER full scroll sweep)
       if (localMonitor.failedRequests.length > 0) {
-        console.error(`    ❌ HTTP >= 400 responses on local mirror:`, localMonitor.failedRequests);
-        totalFailures++;
+        errs.push(`    ❌ HTTP >= 400 responses on local mirror: ${JSON.stringify(localMonitor.failedRequests)}`);
+        pairFailures++;
       }
       if (localMonitor.escapedExternal.length > 0) {
-        console.error(`    ❌ Escaped external requests on air-gapped mirror:`, localMonitor.escapedExternal);
-        totalFailures++;
+        errs.push(`    ❌ Escaped external requests on air-gapped mirror: ${JSON.stringify(localMonitor.escapedExternal)}`);
+        pairFailures++;
       }
       if (localMonitor.errors.length > 0) {
-        console.error(`    ❌ Uncaught runtime/console errors on local mirror:`, localMonitor.errors);
-        totalFailures++;
+        errs.push(`    ❌ Uncaught runtime/console errors on local mirror: ${JSON.stringify(localMonitor.errors)}`);
+        pairFailures++;
       }
 
       const localStyleIssues = (localMonitor.cdpIssues || []).filter(
@@ -679,17 +670,33 @@ async function run() {
         ...(localLazyIssues.length > liveLazyIssues.length ? localLazyIssues.slice(liveLazyIssues.length) : [])
       ];
       if (actionableCdpIssues.length > 0) {
-        console.error(
-          `    ❌ Chrome CDP Audit Violations (${actionableCdpIssues.length}):`,
-          JSON.stringify(actionableCdpIssues[0]?.issue?.details || actionableCdpIssues[0])
+        errs.push(
+          `    ❌ Chrome CDP Audit Violations (${actionableCdpIssues.length}): ${JSON.stringify(actionableCdpIssues[0]?.issue?.details || actionableCdpIssues[0])}`
         );
-        totalFailures++;
+        pairFailures++;
       }
-
+    } finally {
       await liveCtx.close();
       await localCtx.close();
     }
-  }
+
+    for (const line of logs) console.log(line);
+    for (const line of errs) console.error(line);
+    totalFailures += pairFailures;
+    comparisons.push(...pairComparisons);
+  };
+
+  const pairs = ROUTES.flatMap((route) => VIEWPORTS.map((vp) => ({ route, vp })));
+  const CONCURRENCY = 4;
+  let nextIdx = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, pairs.length) }, async () => {
+      while (nextIdx < pairs.length) {
+        const pair = pairs[nextIdx++];
+        await auditPair(pair);
+      }
+    })
+  );
 
   await browser.close();
 
