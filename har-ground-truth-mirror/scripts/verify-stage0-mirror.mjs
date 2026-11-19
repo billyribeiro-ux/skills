@@ -427,7 +427,7 @@ async function run() {
     process.exit(1);
   }
 
-  const browser = await chromium.launch({
+  const launchBrowser = () => chromium.launch({
     headless: true,
     args: [
       '--disable-background-timer-throttling',
@@ -447,7 +447,7 @@ async function run() {
     }
   };
 
-  const auditPair = async ({ route, vp }) => {
+  const auditPair = async (browser, { route, vp }) => {
     const liveTarget = new URL(route, LIVE_URL).href;
     const localTarget = new URL(route, LOCAL_URL).href;
     const logs = [`\n----------------------------------------`, `Checking Route: ${route} | 📱 Viewport: ${vp.name} (${vp.width}x${vp.height})`];
@@ -603,10 +603,10 @@ async function run() {
         await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
         await Promise.all([livePage.waitForTimeout(100), localPage.waitForTimeout(100)]);
 
-        const [liveShot, localShot] = await Promise.all([
-          livePage.screenshot({ timeout: 15000 }),
-          localPage.screenshot({ timeout: 15000 })
-        ]);
+        await livePage.bringToFront();
+        const liveShot = await livePage.screenshot({ timeout: 20000 });
+        await localPage.bringToFront();
+        const localShot = await localPage.screenshot({ timeout: 20000 });
         const imgLive = PNG.sync.read(liveShot);
         const imgLocal = PNG.sync.read(localShot);
         const diff = new PNG({ width: vp.width, height: vp.height });
@@ -687,18 +687,21 @@ async function run() {
   };
 
   const pairs = ROUTES.flatMap((route) => VIEWPORTS.map((vp) => ({ route, vp })));
-  const CONCURRENCY = 4;
+  const CONCURRENCY = 3;
   let nextIdx = 0;
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, pairs.length) }, async () => {
-      while (nextIdx < pairs.length) {
-        const pair = pairs[nextIdx++];
-        await auditPair(pair);
+      const workerBrowser = await launchBrowser();
+      try {
+        while (nextIdx < pairs.length) {
+          const pair = pairs[nextIdx++];
+          await auditPair(workerBrowser, pair);
+        }
+      } finally {
+        await workerBrowser.close();
       }
     })
   );
-
-  await browser.close();
 
   fs.writeFileSync(
     path.join(REPORT_DIR, 'stage0-parity-report.json'),
