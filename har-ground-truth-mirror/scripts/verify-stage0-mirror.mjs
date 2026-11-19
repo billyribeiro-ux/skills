@@ -684,7 +684,7 @@ async function run() {
   };
 
   const pairs = ROUTES.flatMap((route) => VIEWPORTS.map((vp) => ({ route, vp })));
-  const CONCURRENCY = 2;
+  const CONCURRENCY = 1;
   let nextIdx = 0;
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, pairs.length) }, async () => {
@@ -692,7 +692,12 @@ async function run() {
       try {
         while (nextIdx < pairs.length) {
           const pair = pairs[nextIdx++];
-          let res = await auditPair(workerBrowser, pair);
+          let res;
+          try {
+            res = await auditPair(workerBrowser, pair);
+          } catch {
+            res = await auditPair(workerBrowser, pair);
+          }
           if (res.pairFailures > 0) {
             res = await auditPair(workerBrowser, pair);
           }
