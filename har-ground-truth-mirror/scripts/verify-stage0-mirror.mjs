@@ -579,8 +579,8 @@ async function run() {
         await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
         if (liveY > 0 || localY > 0) {
           await Promise.all([
-            livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
-            localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
+            livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { }),
+            localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { })
           ]);
         }
         await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
