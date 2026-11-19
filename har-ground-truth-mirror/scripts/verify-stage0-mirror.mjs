@@ -463,9 +463,20 @@ async function run() {
       const liveMonitor = await inspectSurface(livePage, false);
       const localMonitor = await inspectSurface(localPage, true);
 
+      const gotoWithRetry = async (page, target) => {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            return await page.goto(target, { waitUntil: 'load', timeout: 45000 });
+          } catch (err) {
+            if (attempt === 3) throw err;
+            await page.waitForTimeout(1000 * attempt);
+          }
+        }
+      };
+
       const [liveRes, localRes] = await Promise.all([
-        livePage.goto(liveTarget, { waitUntil: 'load', timeout: 45000 }),
-        localPage.goto(localTarget, { waitUntil: 'load', timeout: 45000 })
+        gotoWithRetry(livePage, liveTarget),
+        gotoWithRetry(localPage, localTarget)
       ]);
 
       if (!localRes || localRes.status() >= 400) {
