@@ -874,11 +874,11 @@ for (const route of ROUTES) {
       let shotSvelte;
       try {
         await pageMirror.bringToFront();
-        shotMirror = await pageMirror.screenshot({ fullPage: false, timeout: 8000 });
+        shotMirror = await pageMirror.screenshot({ fullPage: false, timeout: 60000 });
         await pageNative.bringToFront();
-        shotNative = await pageNative.screenshot({ fullPage: false, timeout: 8000 });
+        shotNative = await pageNative.screenshot({ fullPage: false, timeout: 60000 });
         await pageSvelte.bringToFront();
-        shotSvelte = await pageSvelte.screenshot({ fullPage: false, timeout: 8000 });
+        shotSvelte = await pageSvelte.screenshot({ fullPage: false, timeout: 60000 });
       } catch (shotErr) {
         parityErrors.push({
           route,

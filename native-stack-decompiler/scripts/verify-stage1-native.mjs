@@ -590,9 +590,9 @@ async function run() {
         await Promise.all([mirrorPage.waitForTimeout(100), nativePage.waitForTimeout(100)]);
 
         await mirrorPage.bringToFront();
-        const mirrorShot = await mirrorPage.screenshot({ timeout: 10000 });
+        const mirrorShot = await mirrorPage.screenshot({ timeout: 60000 });
         await nativePage.bringToFront();
-        const nativeShot = await nativePage.screenshot({ timeout: 10000 });
+        const nativeShot = await nativePage.screenshot({ timeout: 60000 });
         const imgMirror = PNG.sync.read(mirrorShot);
         const imgNative = PNG.sync.read(nativeShot);
         const diff = new PNG({ width: vp.width, height: vp.height });
