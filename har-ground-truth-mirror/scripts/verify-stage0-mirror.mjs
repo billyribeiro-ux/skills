@@ -479,8 +479,8 @@ async function run() {
         localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { })
       ]);
       await Promise.all([
-        livePage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { }),
-        localPage.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => { })
+        livePage.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { }),
+        localPage.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { })
       ]);
       await Promise.all([
         livePage.evaluate(() => document.fonts?.ready).catch(() => { }),
@@ -586,14 +586,20 @@ async function run() {
             livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { }),
             localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { })
           ]);
+          await Promise.all([livePage.waitForTimeout(250), localPage.waitForTimeout(250)]);
+          await Promise.all([
+            livePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { }),
+            localPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { })
+          ]);
+        } else {
+          await Promise.all([livePage.waitForTimeout(200), localPage.waitForTimeout(200)]);
         }
-        await Promise.all([livePage.waitForTimeout(450), localPage.waitForTimeout(450)]);
         await Promise.all([
           livePage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { }),
           localPage.waitForFunction(() => window.__AGY_CLOCK_SETTLED__?.(), { timeout: 4000 }).catch(() => { })
         ]);
         await Promise.all([freezeFrameDeterministically(livePage), freezeFrameDeterministically(localPage)]);
-        await Promise.all([livePage.waitForTimeout(150), localPage.waitForTimeout(150)]);
+        await Promise.all([livePage.waitForTimeout(100), localPage.waitForTimeout(100)]);
 
         await livePage.bringToFront();
         const liveShot = await livePage.screenshot({ timeout: 10000 });
