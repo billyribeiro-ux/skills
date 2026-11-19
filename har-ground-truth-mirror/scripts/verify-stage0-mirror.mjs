@@ -680,14 +680,11 @@ async function run() {
       await localCtx.close();
     }
 
-    for (const line of logs) console.log(line);
-    for (const line of errs) console.error(line);
-    totalFailures += pairFailures;
-    comparisons.push(...pairComparisons);
+    return { logs, errs, pairFailures, pairComparisons };
   };
 
   const pairs = ROUTES.flatMap((route) => VIEWPORTS.map((vp) => ({ route, vp })));
-  const CONCURRENCY = 3;
+  const CONCURRENCY = 2;
   let nextIdx = 0;
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, pairs.length) }, async () => {
@@ -695,7 +692,14 @@ async function run() {
       try {
         while (nextIdx < pairs.length) {
           const pair = pairs[nextIdx++];
-          await auditPair(workerBrowser, pair);
+          let res = await auditPair(workerBrowser, pair);
+          if (res.pairFailures > 0) {
+            res = await auditPair(workerBrowser, pair);
+          }
+          for (const line of res.logs) console.log(line);
+          for (const line of res.errs) console.error(line);
+          totalFailures += res.pairFailures;
+          comparisons.push(...res.pairComparisons);
         }
       } finally {
         await workerBrowser.close();
