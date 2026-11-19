@@ -314,10 +314,14 @@ async function freezeFrameDeterministically(page) {
         if (timing && timing.iterations === Infinity) {
           anim.currentTime = 0;
           anim.pause();
-        } else if (anim.playState === 'running') {
-          const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
-          if (Number.isFinite(end) && end > 0) anim.currentTime = end;
-          anim.pause();
+        } else if (anim.playState === 'running' || anim.playState === 'pending') {
+          try {
+            anim.finish();
+          } catch {
+            const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
+            if (Number.isFinite(end) && end > 0) anim.currentTime = end;
+            anim.pause();
+          }
         }
       } catch { }
     }
