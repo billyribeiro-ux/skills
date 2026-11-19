@@ -331,10 +331,14 @@ async function stabilizePageUnmasked(page) {
         if (timing && timing.iterations === Infinity) {
           anim.currentTime = 0;
           anim.pause();
-        } else if (anim.playState === 'running') {
-          const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
-          if (Number.isFinite(end) && end > 0) anim.currentTime = end;
-          anim.pause();
+        } else if (anim.playState === 'running' || anim.playState === 'pending') {
+          try {
+            anim.finish();
+          } catch {
+            const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
+            if (Number.isFinite(end) && end > 0) anim.currentTime = end;
+            anim.pause();
+          }
         }
       } catch { }
     }
@@ -470,10 +474,140 @@ for (const route of ROUTES) {
     });
 
     const seedPrng = () => {
-      let seed = 1337;
+      const hashStr = (str) => {
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < str.length; i++) {
+          h ^= str.charCodeAt(i);
+          h = Math.imul(h, 16777619) >>> 0;
+        }
+        return h || 1337;
+      };
+      let defaultSeed = 1337;
+      let activeSeed = 1337;
+      let usingCanvasSeed = false;
+      const origGetContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+        const ctx = origGetContext.call(this, type, ...args);
+        if (ctx) {
+          const key = String(type || '2d');
+          let sig = `${key}:offscreen:${this.width}x${this.height}`;
+          if (this.isConnected) {
+            const r = this.getBoundingClientRect();
+            const bucketY = Math.round((r.top + window.scrollY) / 100);
+            sig = `${key}:y${bucketY}:${Math.round(r.width)}x${Math.round(r.height)}`;
+          }
+          activeSeed = hashStr(sig);
+          usingCanvasSeed = true;
+          queueMicrotask(() => {
+            usingCanvasSeed = false;
+          });
+        }
+        return ctx;
+      };
       Math.random = () => {
-        seed = (seed * 1664525 + 1013904223) >>> 0;
-        return seed / 4294967296;
+        if (usingCanvasSeed) {
+          activeSeed = (Math.imul(activeSeed, 1664525) + 1013904223) >>> 0;
+          return activeSeed / 4294967296;
+        }
+        defaultSeed = (Math.imul(defaultSeed, 1664525) + 1013904223) >>> 0;
+        return defaultSeed / 4294967296;
+      };
+
+      let clockFrozen = true;
+      let virtualNowMs = 1000;
+      const origPerfNow = performance.now.bind(performance);
+      try {
+        Object.defineProperty(performance, 'now', {
+          value: () => (clockFrozen ? virtualNowMs : origPerfNow()),
+          configurable: true
+        });
+      } catch { }
+
+      const origSetTimeout = window.setTimeout.bind(window);
+      const origClearTimeout = window.clearTimeout.bind(window);
+      window.setTimeout = (fn, delay = 0, ...rest) => {
+        if (clockFrozen && typeof fn === 'function' && Number(delay) >= 3000) {
+          return 900001;
+        }
+        return origSetTimeout(fn, delay, ...rest);
+      };
+      window.clearTimeout = (id) => {
+        if (typeof id === 'number' && id >= 900001) return;
+        return origClearTimeout(id);
+      };
+
+      const origRAF = window.requestAnimationFrame.bind(window);
+      const origCancelRAF = window.cancelAnimationFrame.bind(window);
+      let nextRafId = 1;
+      const pendingRafs = new Map();
+      const origSetInterval = window.setInterval.bind(window);
+      const origClearInterval = window.clearInterval.bind(window);
+      let nextIntervalId = 1;
+      const intervals = new Map();
+      const liveIntervalIds = new Map();
+
+      window.setInterval = (fn, delay = 16, ...rest) => {
+        if (!clockFrozen) return origSetInterval(fn, delay, ...rest);
+        const id = nextIntervalId++;
+        const ms = Math.max(16, Number(delay) || 16);
+        intervals.set(id, { fn, ms, nextAt: virtualNowMs + ms, rest });
+        return id;
+      };
+      window.clearInterval = (id) => {
+        intervals.delete(id);
+        const liveId = liveIntervalIds.get(id);
+        if (liveId !== undefined) {
+          liveIntervalIds.delete(id);
+          return origClearInterval(liveId);
+        }
+        return origClearInterval(id);
+      };
+      window.requestAnimationFrame = (cb) => {
+        if (!clockFrozen) return origRAF(cb);
+        const id = nextRafId++;
+        pendingRafs.set(id, cb);
+        return id;
+      };
+      window.cancelAnimationFrame = (id) => {
+        if (pendingRafs.delete(id)) return;
+        return origCancelRAF(id);
+      };
+      window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
+        if (!clockFrozen) return;
+        defaultSeed = hashStr(`tick:${virtualNowMs}`);
+        const end = virtualNowMs + deltaMs;
+        while (virtualNowMs < end && (pendingRafs.size > 0 || intervals.size > 0)) {
+          virtualNowMs = Math.min(end, virtualNowMs + 16);
+          const batch = Array.from(pendingRafs.values());
+          pendingRafs.clear();
+          for (const cb of batch) {
+            try {
+              cb(virtualNowMs);
+            } catch { }
+          }
+          for (const item of Array.from(intervals.values())) {
+            if (virtualNowMs >= item.nextAt) {
+              item.nextAt = virtualNowMs + item.ms;
+              try {
+                if (typeof item.fn === 'function') item.fn(...item.rest);
+              } catch { }
+            }
+          }
+        }
+        virtualNowMs = end;
+      };
+      window.__AGY_UNFREEZE_CLOCK__ = () => {
+        if (!clockFrozen) return;
+        clockFrozen = false;
+        const batch = Array.from(pendingRafs.values());
+        pendingRafs.clear();
+        for (const cb of batch) {
+          origRAF(cb);
+        }
+        for (const [id, item] of intervals.entries()) {
+          liveIntervalIds.set(id, origSetInterval(item.fn, item.ms, ...item.rest));
+        }
+        intervals.clear();
       };
     };
     await pageMirror.addInitScript(seedPrng);
@@ -487,9 +621,9 @@ for (const route of ROUTES) {
     console.log(`  Auditing Route "${route}" @ ${vp.label}...`);
 
     const [resMirror, resNative, resSvelte] = await Promise.all([
-      pageMirror.goto(targetUrlMirror, { waitUntil: 'domcontentloaded', timeout: 30000 }),
-      pageNative.goto(targetUrlNative, { waitUntil: 'domcontentloaded', timeout: 30000 }),
-      pageSvelte.goto(targetUrlSvelte, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      pageMirror.goto(targetUrlMirror, { waitUntil: 'load', timeout: 30000 }),
+      pageNative.goto(targetUrlNative, { waitUntil: 'load', timeout: 30000 }),
+      pageSvelte.goto(targetUrlSvelte, { waitUntil: 'load', timeout: 30000 })
     ]);
 
     if (!resSvelte || resSvelte.status() >= 400 || resSvelte.status() !== (resNative?.status() ?? 200)) {
@@ -501,33 +635,28 @@ for (const route of ROUTES) {
       });
     }
 
+    await Promise.all([pageMirror.waitForTimeout(300), pageNative.waitForTimeout(300), pageSvelte.waitForTimeout(300)]);
+    await Promise.all([
+      pageMirror.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { }),
+      pageNative.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { }),
+      pageSvelte.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { })
+    ]);
+    await Promise.all([
+      pageMirror.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { }),
+      pageNative.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { }),
+      pageSvelte.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { })
+    ]);
     await Promise.all([
       pageMirror.evaluate(() => document.fonts?.ready).catch(() => { }),
       pageNative.evaluate(() => document.fonts?.ready).catch(() => { }),
       pageSvelte.evaluate(() => document.fonts?.ready).catch(() => { })
     ]);
-    await Promise.all([pageMirror.waitForTimeout(1200), pageNative.waitForTimeout(1200), pageSvelte.waitForTimeout(1200)]);
-
-    // Gate 5C: Site-Agnostic Living Canvas, Smooth Scroll & Mount-Reveal Parity (Desktop)
-    if (vp.width >= 1024) {
-      const living = await auditKineticAndLivingSurface({
-        page: pageSvelte,
-        route,
-        forensicsDir,
-        mirrorPage: pageMirror
-      });
-      console.log(
-        `    🎨 Gate 5 Living Surface: canvases=${living.summary.activeCanvases}/${living.summary.canvasCount}, rafDelta=${living.summary.rafDelta}, reveals=${living.summary.mountRevealsChecked}, controls=${living.summary.testedControls}`
-      );
-      for (const lf of living.failures) {
-        parityErrors.push({
-          route,
-          viewport: vp.label,
-          metric: 'Gate 5 Living Surface',
-          error: lf
-        });
-      }
-    }
+    await Promise.all([pageMirror.waitForTimeout(600), pageNative.waitForTimeout(600), pageSvelte.waitForTimeout(600)]);
+    await Promise.all([
+      pageMirror.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
+      pageNative.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
+      pageSvelte.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
+    ]);
 
     // Check Horizontal Overflow Leak & Form A11y & Non-Blank Canvas Integrity
     const domIntegrity = await pageSvelte.evaluate(() => {
@@ -722,7 +851,20 @@ for (const route of ROUTES) {
           window.scrollTo(0, Math.round(Math.max(0, document.documentElement.scrollHeight - window.innerHeight) * p));
         }, pct)
       ]);
-      await Promise.all([pageMirror.waitForTimeout(250), pageNative.waitForTimeout(250), pageSvelte.waitForTimeout(250)]);
+      await Promise.all([pageMirror.waitForTimeout(200), pageNative.waitForTimeout(200), pageSvelte.waitForTimeout(200)]);
+      if (pct > 0) {
+        await Promise.all([
+          pageMirror.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { }),
+          pageNative.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { }),
+          pageSvelte.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { })
+        ]);
+        await Promise.all([pageMirror.waitForTimeout(200), pageNative.waitForTimeout(200), pageSvelte.waitForTimeout(200)]);
+        await Promise.all([
+          pageMirror.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { }),
+          pageNative.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { }),
+          pageSvelte.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { })
+        ]);
+      }
       await Promise.all([stabilizePageUnmasked(pageMirror), stabilizePageUnmasked(pageNative), stabilizePageUnmasked(pageSvelte)]);
       await Promise.all([pageMirror.mouse.move(0, 0), pageNative.mouse.move(0, 0), pageSvelte.mouse.move(0, 0)]);
       await Promise.all([pageMirror.waitForTimeout(100), pageNative.waitForTimeout(100), pageSvelte.waitForTimeout(100)]);
@@ -797,6 +939,33 @@ for (const route of ROUTES) {
           viewport: vp.label,
           metric: `Unmasked Visual Diff vs Mirror @ ${Math.round(pct * 100)}%`,
           error: `Diff ${(diffRatioMirror * 100).toFixed(3)}% exceeded ${(THRESHOLD * 100).toFixed(2)}% threshold (${diffMirrorFile})`
+        });
+      }
+    }
+
+    // Gate 5C: Site-Agnostic Living Canvas, Smooth Scroll & Mount-Reveal Parity (Desktop, with live RAF unfrozen!)
+    if (vp.width >= 1024) {
+      await Promise.all([
+        pageMirror.evaluate(() => { window.scrollTo(0, 0); window.__AGY_UNFREEZE_CLOCK__?.(); }).catch(() => { }),
+        pageNative.evaluate(() => { window.scrollTo(0, 0); window.__AGY_UNFREEZE_CLOCK__?.(); }).catch(() => { }),
+        pageSvelte.evaluate(() => { window.scrollTo(0, 0); window.__AGY_UNFREEZE_CLOCK__?.(); }).catch(() => { })
+      ]);
+      await Promise.all([pageMirror.waitForTimeout(200), pageNative.waitForTimeout(200), pageSvelte.waitForTimeout(200)]);
+      const living = await auditKineticAndLivingSurface({
+        page: pageSvelte,
+        route,
+        forensicsDir,
+        mirrorPage: pageMirror
+      });
+      console.log(
+        `    🎨 Gate 5 Living Surface: canvases=${living.summary.activeCanvases}/${living.summary.canvasCount}, rafDelta=${living.summary.rafDelta}, reveals=${living.summary.mountRevealsChecked}, controls=${living.summary.testedControls}`
+      );
+      for (const lf of living.failures) {
+        parityErrors.push({
+          route,
+          viewport: vp.label,
+          metric: 'Gate 5 Living Surface',
+          error: lf
         });
       }
     }

@@ -119,10 +119,140 @@ async function inspectSurface(page, expectedOrigin, checkScriptProvenance) {
   } catch { }
 
   await page.addInitScript(() => {
-    let seed = 1337;
+    const hashStr = (str) => {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h || 1337;
+    };
+    let defaultSeed = 1337;
+    let activeSeed = 1337;
+    let usingCanvasSeed = false;
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+      const ctx = origGetContext.call(this, type, ...args);
+      if (ctx) {
+        const key = String(type || '2d');
+        let sig = `${key}:offscreen:${this.width}x${this.height}`;
+        if (this.isConnected) {
+          const r = this.getBoundingClientRect();
+          const bucketY = Math.round((r.top + window.scrollY) / 100);
+          sig = `${key}:y${bucketY}:${Math.round(r.width)}x${Math.round(r.height)}`;
+        }
+        activeSeed = hashStr(sig);
+        usingCanvasSeed = true;
+        queueMicrotask(() => {
+          usingCanvasSeed = false;
+        });
+      }
+      return ctx;
+    };
     Math.random = () => {
-      seed = (seed * 1664525 + 1013904223) >>> 0;
-      return seed / 4294967296;
+      if (usingCanvasSeed) {
+        activeSeed = (Math.imul(activeSeed, 1664525) + 1013904223) >>> 0;
+        return activeSeed / 4294967296;
+      }
+      defaultSeed = (Math.imul(defaultSeed, 1664525) + 1013904223) >>> 0;
+      return defaultSeed / 4294967296;
+    };
+
+    let clockFrozen = true;
+    let virtualNowMs = 1000;
+    const origPerfNow = performance.now.bind(performance);
+    try {
+      Object.defineProperty(performance, 'now', {
+        value: () => (clockFrozen ? virtualNowMs : origPerfNow()),
+        configurable: true
+      });
+    } catch { }
+
+    const origSetTimeout = window.setTimeout.bind(window);
+    const origClearTimeout = window.clearTimeout.bind(window);
+    window.setTimeout = (fn, delay = 0, ...rest) => {
+      if (clockFrozen && typeof fn === 'function' && Number(delay) >= 3000) {
+        return 900001;
+      }
+      return origSetTimeout(fn, delay, ...rest);
+    };
+    window.clearTimeout = (id) => {
+      if (typeof id === 'number' && id >= 900001) return;
+      return origClearTimeout(id);
+    };
+
+    const origRAF = window.requestAnimationFrame.bind(window);
+    const origCancelRAF = window.cancelAnimationFrame.bind(window);
+    let nextRafId = 1;
+    const pendingRafs = new Map();
+    const origSetInterval = window.setInterval.bind(window);
+    const origClearInterval = window.clearInterval.bind(window);
+    let nextIntervalId = 1;
+    const intervals = new Map();
+    const liveIntervalIds = new Map();
+
+    window.setInterval = (fn, delay = 16, ...rest) => {
+      if (!clockFrozen) return origSetInterval(fn, delay, ...rest);
+      const id = nextIntervalId++;
+      const ms = Math.max(16, Number(delay) || 16);
+      intervals.set(id, { fn, ms, nextAt: virtualNowMs + ms, rest });
+      return id;
+    };
+    window.clearInterval = (id) => {
+      intervals.delete(id);
+      const liveId = liveIntervalIds.get(id);
+      if (liveId !== undefined) {
+        liveIntervalIds.delete(id);
+        return origClearInterval(liveId);
+      }
+      return origClearInterval(id);
+    };
+    window.requestAnimationFrame = (cb) => {
+      if (!clockFrozen) return origRAF(cb);
+      const id = nextRafId++;
+      pendingRafs.set(id, cb);
+      return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+      if (pendingRafs.delete(id)) return;
+      return origCancelRAF(id);
+    };
+    window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
+      if (!clockFrozen) return;
+      defaultSeed = hashStr(`tick:${virtualNowMs}`);
+      const end = virtualNowMs + deltaMs;
+      while (virtualNowMs < end && (pendingRafs.size > 0 || intervals.size > 0)) {
+        virtualNowMs = Math.min(end, virtualNowMs + 16);
+        const batch = Array.from(pendingRafs.values());
+        pendingRafs.clear();
+        for (const cb of batch) {
+          try {
+            cb(virtualNowMs);
+          } catch { }
+        }
+        for (const item of Array.from(intervals.values())) {
+          if (virtualNowMs >= item.nextAt) {
+            item.nextAt = virtualNowMs + item.ms;
+            try {
+              if (typeof item.fn === 'function') item.fn(...item.rest);
+            } catch { }
+          }
+        }
+      }
+      virtualNowMs = end;
+    };
+    window.__AGY_UNFREEZE_CLOCK__ = () => {
+      if (!clockFrozen) return;
+      clockFrozen = false;
+      const batch = Array.from(pendingRafs.values());
+      pendingRafs.clear();
+      for (const cb of batch) {
+        origRAF(cb);
+      }
+      for (const [id, item] of intervals.entries()) {
+        liveIntervalIds.set(id, origSetInterval(item.fn, item.ms, ...item.rest));
+      }
+      intervals.clear();
     };
   });
 
@@ -179,10 +309,14 @@ async function stabilizeForScreenshot(page) {
         if (timing && timing.iterations === Infinity) {
           anim.currentTime = 0;
           anim.pause();
-        } else if (anim.playState === 'running') {
-          const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
-          if (Number.isFinite(end) && end > 0) anim.currentTime = end;
-          anim.pause();
+        } else if (anim.playState === 'running' || anim.playState === 'pending') {
+          try {
+            anim.finish();
+          } catch {
+            const end = Number(timing?.delay || 0) + Number(timing?.duration || 0);
+            if (Number.isFinite(end) && end > 0) anim.currentTime = end;
+            anim.pause();
+          }
         }
       } catch { }
     }
@@ -319,8 +453,8 @@ async function run() {
       const nativeMonitor = await inspectSurface(nativePage, nativeOrigin, true);
 
       const [resM, resN] = await Promise.all([
-        mirrorPage.goto(mirrorTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }),
-        nativePage.goto(nativeTarget, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        mirrorPage.goto(mirrorTarget, { waitUntil: 'load', timeout: 45000 }),
+        nativePage.goto(nativeTarget, { waitUntil: 'load', timeout: 45000 })
       ]);
 
       if (!resN || resN.status() !== (resM?.status() ?? 200)) {
@@ -328,29 +462,24 @@ async function run() {
         totalFailures++;
       }
 
+      await Promise.all([mirrorPage.waitForTimeout(300), nativePage.waitForTimeout(300)]);
+      await Promise.all([
+        mirrorPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { }),
+        nativePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(32)).catch(() => { })
+      ]);
+      await Promise.all([
+        mirrorPage.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { }),
+        nativePage.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => { })
+      ]);
       await Promise.all([
         mirrorPage.evaluate(() => document.fonts?.ready).catch(() => { }),
         nativePage.evaluate(() => document.fonts?.ready).catch(() => { })
       ]);
-      await Promise.all([mirrorPage.waitForTimeout(1400), nativePage.waitForTimeout(1400)]);
-
-      // 0. Living Canvas, Smooth Scroll & Interactive Contracts Audit (Desktop)
-      if (vp.name === 'desktop') {
-        const living = await auditKineticAndLivingSurface({
-          page: nativePage,
-          route,
-          forensicsDir: mirrorForensicsDir,
-          mirrorPage
-        });
-        console.log(
-          `    🎨 Living Surface: canvases=${living.summary.activeCanvases}/${living.summary.canvasCount}, rafDelta=${living.summary.rafDelta}, revealsChecked=${living.summary.mountRevealsChecked}, controls=${living.summary.testedControls}`
-        );
-        for (const lf of living.failures) {
-          console.error(`    ❌ [LIVING GATE FAIL] ${lf}`);
-          livingViolations.push({ route, error: lf });
-          totalFailures++;
-        }
-      }
+      await Promise.all([mirrorPage.waitForTimeout(600), nativePage.waitForTimeout(600)]);
+      await Promise.all([
+        mirrorPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { }),
+        nativePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1000)).catch(() => { })
+      ]);
 
       // 1. Real Kinetic Scroll-Scrub Trajectory Verification (0%, 20%, 40%, 60%, 80%, 100%)
       const [mirrorHeight, nativeHeight] = await Promise.all([
@@ -445,7 +574,18 @@ async function run() {
           mirrorPage.evaluate((y) => window.scrollTo(0, y), mirrorY),
           nativePage.evaluate((y) => window.scrollTo(0, y), nativeY)
         ]);
-        await Promise.all([mirrorPage.waitForTimeout(250), nativePage.waitForTimeout(250)]);
+        await Promise.all([mirrorPage.waitForTimeout(200), nativePage.waitForTimeout(200)]);
+        if (mirrorY > 0 || nativeY > 0) {
+          await Promise.all([
+            mirrorPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { }),
+            nativePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1600)).catch(() => { })
+          ]);
+          await Promise.all([mirrorPage.waitForTimeout(200), nativePage.waitForTimeout(200)]);
+          await Promise.all([
+            mirrorPage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { }),
+            nativePage.evaluate(() => window.__AGY_ADVANCE_CLOCK__?.(1200)).catch(() => { })
+          ]);
+        }
         await Promise.all([stabilizeForScreenshot(mirrorPage), stabilizeForScreenshot(nativePage)]);
         await Promise.all([mirrorPage.waitForTimeout(100), nativePage.waitForTimeout(100)]);
 
@@ -487,7 +627,30 @@ async function run() {
         }
       }
 
-      // 3. Anti-Chunk Network Provenance, Errors, 404s, Escapes & CDP Audits
+      // 3. Living Canvas, Smooth Scroll & Interactive Contracts Audit (Desktop, with live RAF unfrozen!)
+      if (vp.name === 'desktop') {
+        await Promise.all([
+          mirrorPage.evaluate(() => { window.scrollTo(0, 0); window.__AGY_UNFREEZE_CLOCK__?.(); }).catch(() => { }),
+          nativePage.evaluate(() => { window.scrollTo(0, 0); window.__AGY_UNFREEZE_CLOCK__?.(); }).catch(() => { })
+        ]);
+        await Promise.all([mirrorPage.waitForTimeout(200), nativePage.waitForTimeout(200)]);
+        const living = await auditKineticAndLivingSurface({
+          page: nativePage,
+          route,
+          forensicsDir: mirrorForensicsDir,
+          mirrorPage
+        });
+        console.log(
+          `    🎨 Living Surface: canvases=${living.summary.activeCanvases}/${living.summary.canvasCount}, rafDelta=${living.summary.rafDelta}, revealsChecked=${living.summary.mountRevealsChecked}, controls=${living.summary.testedControls}`
+        );
+        for (const lf of living.failures) {
+          console.error(`    ❌ [LIVING GATE FAIL] ${lf}`);
+          livingViolations.push({ route, error: lf });
+          totalFailures++;
+        }
+      }
+
+      // 4. Anti-Chunk Network Provenance, Errors, 404s, Escapes & CDP Audits
       if (nativeMonitor.forbiddenScripts.length > 0) {
         console.error(`    ❌ [CHUNK_BYPASS_DETECTED] Native server attempted to load mirrored chunks:`, nativeMonitor.forbiddenScripts);
         totalFailures++;

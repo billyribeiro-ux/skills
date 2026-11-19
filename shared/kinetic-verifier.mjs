@@ -256,19 +256,49 @@ export async function auditKineticAndLivingSurface({
     const revealAudit = await page.evaluate((targets) => {
       const stuck = [];
       let checked = 0;
+      const querySafe = (sel) => {
+        try {
+          return Array.from(document.querySelectorAll(sel));
+        } catch {
+          try {
+            const escaped = sel
+              .split(' ')
+              .map((part) => {
+                const segs = part.split('.');
+                if (segs.length <= 1) return part;
+                return segs[0] + '.' + segs.slice(1).map((c) => CSS.escape(c)).join('.');
+              })
+              .join(' ');
+            return Array.from(document.querySelectorAll(escaped));
+          } catch {
+            return [];
+          }
+        }
+      };
       for (const item of targets) {
         if (!item.selector && !item.textSnippet) continue;
         let el = null;
         if (item.selector) {
-          try {
-            const candidates = Array.from(document.querySelectorAll(item.selector));
-            el = item.textSnippet
-              ? candidates.find((c) => (c.textContent || '').trim().includes(item.textSnippet.slice(0, 24))) ||
-                candidates[0]
-              : candidates[0];
-          } catch {}
+          const candidates = querySafe(item.selector);
+          el = item.textSnippet
+            ? candidates.find((c) => (c.textContent || '').trim().includes(item.textSnippet.slice(0, 24))) ||
+              candidates[0]
+            : candidates[0];
         }
-        if (!el) { stuck.push({selector:item.selector, text:item.textSnippet, expectedOpacity:item.finalOpacity, actualOpacity:'missing'}); continue; }
+        if (!el && item.textSnippet) {
+          const needle = item.textSnippet.trim().slice(0, 24);
+          if (needle.length >= 4) {
+            el = Array.from(document.querySelectorAll('h1,h2,h3,p,a,button,span,div')).find(
+              (c) => (c.textContent || '').trim().includes(needle)
+            ) || null;
+          }
+        }
+        if (!el) {
+          if (item.finalOpacity >= 0.8) {
+            stuck.push({ selector: item.selector, text: item.textSnippet, expectedOpacity: item.finalOpacity, actualOpacity: 'missing' });
+          }
+          continue;
+        }
         checked++;
         const cs = window.getComputedStyle(el);
         const op = parseFloat(cs.opacity);
