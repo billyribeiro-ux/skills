@@ -196,6 +196,18 @@ async function inspectSurface(page, isLocalAirgap) {
 
     let nextRafId = 1;
     const pendingRafs = new Map();
+    let nextIntervalId = 1;
+    const intervals = new Map();
+
+    window.setInterval = (fn, delay = 16, ...rest) => {
+      const id = nextIntervalId++;
+      const ms = Math.max(16, Number(delay) || 16);
+      intervals.set(id, { fn, ms, nextAt: virtualNowMs + ms, rest });
+      return id;
+    };
+    window.clearInterval = (id) => {
+      intervals.delete(id);
+    };
 
     window.requestAnimationFrame = (cb) => {
       const id = nextRafId++;
@@ -206,8 +218,9 @@ async function inspectSurface(page, isLocalAirgap) {
       pendingRafs.delete(id);
     };
     window.__AGY_ADVANCE_CLOCK__ = (deltaMs = 256) => {
+      defaultSeed = hashStr(`tick:${virtualNowMs}`);
       const end = virtualNowMs + deltaMs;
-      while (virtualNowMs < end && pendingRafs.size > 0) {
+      while (virtualNowMs < end && (pendingRafs.size > 0 || intervals.size > 0)) {
         virtualNowMs = Math.min(end, virtualNowMs + 16);
         const batch = Array.from(pendingRafs.values());
         pendingRafs.clear();
@@ -215,6 +228,14 @@ async function inspectSurface(page, isLocalAirgap) {
           try {
             cb(virtualNowMs);
           } catch { }
+        }
+        for (const item of Array.from(intervals.values())) {
+          if (virtualNowMs >= item.nextAt) {
+            item.nextAt = virtualNowMs + item.ms;
+            try {
+              if (typeof item.fn === 'function') item.fn(...item.rest);
+            } catch { }
+          }
         }
       }
       virtualNowMs = end;
